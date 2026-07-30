@@ -14,7 +14,7 @@ model:
       feature_dim: ${model.texture.non_rigid_dim}
       latent_dim: 0
       pose_encoder:
-        num_joints: 24
+        num_joints: 127
         rel_joints: false
         dim_per_joint: 6
         out_dim: -1

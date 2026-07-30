@@ -18,7 +18,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
 from scene import Scene, GaussianModel
-from utils.general_utils import fix_random, Evaluator, PSEvaluator
+from utils.general_utils import fix_random, PSEvaluator
 from tqdm import tqdm
 from utils.loss_utils import full_aiap_loss
 
@@ -61,7 +61,7 @@ def training(config):
     # define lpips
     lpips_type = config.opt.get('lpips_type', 'vgg')
     loss_fn_vgg = lpips.LPIPS(net=lpips_type).cuda() # for training
-    evaluator = PSEvaluator() if dataset.name == 'people_snapshot' else Evaluator()
+    evaluator = PSEvaluator()
 
     first_iter = 0
     gaussians = GaussianModel(model.gaussian)
@@ -261,12 +261,12 @@ def validation(iteration, testing_iterations, testing_interval, scene : Scene, e
                 opacity_image = torch.clamp(render_pkg["opacity_render"], 0.0, 1.0)
 
 
-                wandb_img = wandb.Image(opacity_image[None],
+                wandb_img = wandb.Image(opacity_image,
                                         caption=config['name'] + "_view_{}/render_opacity".format(data.image_name))
                 examples.append(wandb_img)
-                wandb_img = wandb.Image(image[None], caption=config['name'] + "_view_{}/render".format(data.image_name))
+                wandb_img = wandb.Image(image, caption=config['name'] + "_view_{}/render".format(data.image_name))
                 examples.append(wandb_img)
-                wandb_img = wandb.Image(gt_image[None], caption=config['name'] + "_view_{}/ground_truth".format(
+                wandb_img = wandb.Image(gt_image, caption=config['name'] + "_view_{}/ground_truth".format(
                     data.image_name))
                 examples.append(wandb_img)
 

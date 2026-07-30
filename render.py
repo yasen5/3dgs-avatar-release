@@ -20,7 +20,7 @@ import torchvision
 from utils.general_utils import fix_random
 from scene import GaussianModel
 
-from utils.general_utils import Evaluator, PSEvaluator
+from utils.general_utils import PSEvaluator
 
 import hydra
 from omegaconf import OmegaConf
@@ -57,7 +57,7 @@ def predict(config):
 
             rendering = render_pkg["render"]
 
-            wandb_img = [wandb.Image(rendering[None], caption='render_{}'.format(view.image_name)),]
+            wandb_img = [wandb.Image(rendering, caption='render_{}'.format(view.image_name)),]
             wandb.log({'test_images': wandb_img})
 
             torchvision.utils.save_image(rendering, os.path.join(render_path, f"render_{view.image_name}.png"))
@@ -91,7 +91,7 @@ def test(config):
         iter_start = torch.cuda.Event(enable_timing=True)
         iter_end = torch.cuda.Event(enable_timing=True)
 
-        evaluator = PSEvaluator() if config.dataset.name == 'people_snapshot' else Evaluator()
+        evaluator = PSEvaluator()
 
         psnrs = []
         ssims = []
@@ -112,8 +112,8 @@ def test(config):
 
             gt = view.original_image[:3, :, :]
 
-            wandb_img = [wandb.Image(rendering[None], caption='render_{}'.format(view.image_name)),
-                         wandb.Image(gt[None], caption='gt_{}'.format(view.image_name))]
+            wandb_img = [wandb.Image(rendering, caption='render_{}'.format(view.image_name)),
+                         wandb.Image(gt, caption='gt_{}'.format(view.image_name))]
 
             wandb.log({'test_images': wandb_img})
 
@@ -159,18 +159,10 @@ def main(config):
         config.suffix = config.mode + '-' + config.dataset.test_mode
     elif config.mode == 'predict':
         predict_seq = config.dataset.predict_seq
-        if config.dataset.name == 'zjumocap':
-            predict_dict = {
-                0: 'dance0',
-                1: 'dance1',
-                2: 'flipping',
-                3: 'canonical'
-            }
-        else:
-            predict_dict = {
-                0: 'rotation',
-                1: 'dance2',
-            }
+        predict_dict = {
+            0: 'rotation',
+            1: 'dance2',
+        }
         predict_mode = predict_dict[predict_seq]
         config.suffix = config.mode + '-' + predict_mode
     else:

@@ -1,51 +1,8 @@
 import math
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
-from scene.gaussian_model import BasicPointCloud
+from utils.graphics_utils import BasicPointCloud
 from plyfile import PlyData, PlyElement
-
-# add ZJUMoCAP dataloader
-def get_02v_bone_transforms(Jtr,):
-    rot45p = Rotation.from_euler('z', 45, degrees=True).as_matrix()
-    rot45n = Rotation.from_euler('z', -45, degrees=True).as_matrix()
-
-    # Specify the bone transformations that transform a SMPL A-pose mesh
-    # to a star-shaped A-pose (i.e. Vitruvian A-pose)
-    bone_transforms_02v = np.tile(np.eye(4), (24, 1, 1))
-
-    # First chain: L-hip (1), L-knee (4), L-ankle (7), L-foot (10)
-    chain = [1, 4, 7, 10]
-    rot = rot45p.copy()
-    for i, j_idx in enumerate(chain):
-        bone_transforms_02v[j_idx, :3, :3] = rot
-        t = Jtr[j_idx].copy()
-        if i > 0:
-            parent = chain[i-1]
-            t_p = Jtr[parent].copy()
-            t = np.dot(rot, t - t_p)
-            t += bone_transforms_02v[parent, :3, -1].copy()
-
-        bone_transforms_02v[j_idx, :3, -1] = t
-
-    bone_transforms_02v[chain, :3, -1] -= np.dot(Jtr[chain], rot.T)
-    # Second chain: R-hip (2), R-knee (5), R-ankle (8), R-foot (11)
-    chain = [2, 5, 8, 11]
-    rot = rot45n.copy()
-    for i, j_idx in enumerate(chain):
-        bone_transforms_02v[j_idx, :3, :3] = rot
-        t = Jtr[j_idx].copy()
-        if i > 0:
-            parent = chain[i-1]
-            t_p = Jtr[parent].copy()
-            t = np.dot(rot, t - t_p)
-            t += bone_transforms_02v[parent, :3, -1].copy()
-
-        bone_transforms_02v[j_idx, :3, -1] = t
-
-    bone_transforms_02v[chain, :3, -1] -= np.dot(Jtr[chain], rot.T)
-
-    return bone_transforms_02v
 
 def fetchPly(path):
     plydata = PlyData.read(path)

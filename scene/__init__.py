@@ -80,7 +80,7 @@ class Scene:
                     iteration), self.save_dir + "/ckpt" + str(iteration) + ".pth")
 
     def load_checkpoint(self, path):
-        (gaussian_params, converter_sd, converter_opt_sd, converter_scd_sd, first_iter) = torch.load(path)
+        (gaussian_params, converter_sd, converter_opt_sd, converter_scd_sd, first_iter) = torch.load(path, weights_only=False)
         self.gaussians.restore(gaussian_params, self.cfg.opt)
         self.converter.load_state_dict(converter_sd)
         # self.converter.optimizer.load_state_dict(converter_opt_sd)

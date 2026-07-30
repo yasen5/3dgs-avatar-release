@@ -26,7 +26,7 @@ class Identity(NonRigidDeform):
 class MLP(NonRigidDeform):
     def __init__(self, cfg, metadata):
         super().__init__(cfg)
-        self.pose_encoder = HierarchicalPoseEncoder(**cfg.pose_encoder)
+        self.pose_encoder = HierarchicalPoseEncoder(**cfg.pose_encoder, ktree_parents=metadata['joint_parents'])
         d_cond = self.pose_encoder.n_output_dims
 
         # add latent code
@@ -126,7 +126,7 @@ class MLP(NonRigidDeform):
 class HannwMLP(NonRigidDeform):
     def __init__(self, cfg, metadata):
         super().__init__(cfg)
-        self.pose_encoder = HierarchicalPoseEncoder(**cfg.pose_encoder)
+        self.pose_encoder = HierarchicalPoseEncoder(**cfg.pose_encoder, ktree_parents=metadata['joint_parents'])
         # output dimension: position + scale + rotation
         self.mlp = HannwCondMLP(3, self.pose_encoder.n_output_dims, 3 + 3 + 4, cfg.mlp, dim_coord=3)
         self.aabb = metadata['aabb']
@@ -191,7 +191,7 @@ class HannwMLP(NonRigidDeform):
 class HashGridwithMLP(NonRigidDeform):
     def __init__(self, cfg, metadata):
         super().__init__(cfg)
-        self.pose_encoder = HierarchicalPoseEncoder(**cfg.pose_encoder)
+        self.pose_encoder = HierarchicalPoseEncoder(**cfg.pose_encoder, ktree_parents=metadata['joint_parents'])
         d_cond = self.pose_encoder.n_output_dims
 
         # add latent code

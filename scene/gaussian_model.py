@@ -233,7 +233,11 @@ class GaussianModel:
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        # All channels except the 3 DC
+        # NOTE: when use_sh=False (this repo's default), these are NOT SH
+        # coefficients -- they are an arbitrary learned per-Gaussian latent
+        # feature vector consumed by the texture MLP (models/texture/texture.py),
+        # not literal color. The f_dc_/f_rest_ names are kept only for
+        # PLY-format compatibility with the vanilla 3DGS layout.
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
             l.append('f_dc_{}'.format(i))
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
@@ -245,7 +249,16 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, colors=None):
+        """
+        colors: optional (N,3) array/tensor in [0,1] -- baked RGB for a specific
+        reference camera/pose/frame (this model's appearance is view- and
+        pose-dependent, produced by a neural texture network, so there is no
+        single "true" static color; this is a representative snapshot for
+        visualization in generic PLY viewers). Written as standard uchar
+        red/green/blue properties alongside the exact latent feature fields
+        needed to reconstruct the model exactly.
+        """
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         xyz = self._xyz.detach().cpu().numpy()
@@ -256,13 +269,65 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
-        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        attribute_names = self.construct_list_of_attributes()
+        dtype_full = [(attribute, 'f4') for attribute in attribute_names]
+        attributes = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
+
+        if colors is not None:
+            if torch.is_tensor(colors):
+                colors = colors.detach().cpu().numpy()
+            rgb_u8 = np.clip(colors, 0.0, 1.0) * 255.0
+            rgb_u8 = np.rint(rgb_u8).astype(np.uint8)
+            dtype_full += [('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
+        packed = np.concatenate(attributes, axis=1)
+        for i, name in enumerate(attribute_names):
+            elements[name] = packed[:, i]
+        if colors is not None:
+            elements['red'] = rgb_u8[:, 0]
+            elements['green'] = rgb_u8[:, 1]
+            elements['blue'] = rgb_u8[:, 2]
+
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
+    def load_ply_generic(self, path):
+        """
+        Reload canonical Gaussian parameters saved by save_ply(), without
+        assuming SH-mode layout (unlike the vanilla load_ply below, which
+        hardcodes 3-channel SH coefficients and breaks for this repo's
+        default use_sh=False / feature_dim=32 latent-feature configuration).
+        Column counts are inferred directly from the file, so this reproduces
+        the exact _features_dc / _features_rest tensors that were saved,
+        independent of use_sh.
+        """
+        plydata = PlyData.read(path)
+        v = plydata.elements[0]
+
+        xyz = np.ascontiguousarray(np.stack((np.asarray(v["x"]), np.asarray(v["y"]), np.asarray(v["z"])), axis=1))
+        opacities = np.ascontiguousarray(np.asarray(v["opacity"])[..., np.newaxis])
+
+        def gather_sorted(prefix):
+            names = sorted([p.name for p in v.properties if p.name.startswith(prefix)],
+                            key=lambda n: int(n.split('_')[-1]))
+            if not names:
+                return np.zeros((xyz.shape[0], 0))
+            return np.ascontiguousarray(np.stack([np.asarray(v[n]) for n in names], axis=1))
+
+        f_dc = gather_sorted('f_dc_')
+        f_rest = gather_sorted('f_rest_')
+        scales = gather_sorted('scale_')
+        rots = gather_sorted('rot_')
+
+        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._features_dc = nn.Parameter(
+            torch.tensor(f_dc, dtype=torch.float, device="cuda")[:, :, None].requires_grad_(True))
+        self._features_rest = nn.Parameter(
+            torch.tensor(f_rest, dtype=torch.float, device="cuda")[:, :, None].requires_grad_(True))
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))

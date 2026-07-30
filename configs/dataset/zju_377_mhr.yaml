@@ -1,0 +1,24 @@
+# @package _global_
+
+# CoreView_377 MHR fits prepared by the current ZJU pipeline.  The source
+# directory contains 23 camera folders, but this dataset is deliberately
+# monocular: only Camera_B1 is ever read.
+dataset_name: zju_377_mhr
+
+dataset:
+  name: mhr_native
+  root_dir: "/mnt/ssd2/better_rigs_runs/zju_377_prep/dataset/zju_mocap/CoreView_377"
+  source_layout: zju_mocap
+  camera_name: Camera_B1
+  shape_source: raw
+  mask_dir: masks
+
+  mhr_model_path: "/mnt/ssd2/sam4d_body_checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt"
+  mhr_device: cuda
+
+  preload: false
+  padding: 0.1
+  resolution: -1
+  white_background: false
+  data_device: cuda
+  eval: true

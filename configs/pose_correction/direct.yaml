@@ -1,16 +1,22 @@
 # @package _global_
+# models/pose_correction/pose_correction.py's DirectPoseOptimization: the
+# skeletal/articulated model_params (204) is a learnable per-frame embedding,
+# photometrically refined, initialized from the SAM3D-Body-direct-or-
+# interpolated track from prepare_mhr_keyframe_track.py. shape_params (45,
+# non-skeletal body identity) is frozen everywhere -- see that class's
+# docstring.
 
 pose_name: direct
-
-dataset:
-  train_smpl: true
 
 model:
   pose_correction:
     name: direct
-    delay: 5000
-#    delay: -1
+    delay: 0
 
 opt:
   pose_correction_lr: 1e-4
-  lambda_pose: 0.
+  # small prior keeping pose close to its tracked initialization (see
+  # DirectPoseOptimization.forward's loss_pose) so single noisy frames
+  # (motion blur, an occluder) don't chase implausible poses to minimize
+  # local photometric loss.
+  lambda_pose: 0.01

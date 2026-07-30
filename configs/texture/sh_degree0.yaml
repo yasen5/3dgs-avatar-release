@@ -1,0 +1,17 @@
+# @package _global_
+# No spherical-harmonics view-dependence at all -- degree-0 SH only, i.e. a
+# single flat per-Gaussian RGB (feature_dim=(0+1)^2=1, see
+# scene/gaussian_model.py's use_sh/max_sh_degree wiring).
+
+texture_name: sh_degree0
+
+model:
+  gaussian:
+    use_sh: true
+    sh_degree: 0
+  texture:
+    name: sh2rgb
+    cano_view_dir: true
+    view_noise: 45
+
+    non_rigid_dim: 0

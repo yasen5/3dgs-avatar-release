@@ -119,13 +119,15 @@ def get_hannw_embedder(cfg, multires, iter_val,):
 class HierarchicalPoseEncoder(nn.Module):
     '''Hierarchical encoder from LEAP.'''
 
-    def __init__(self, num_joints=24, rel_joints=False, dim_per_joint=6, out_dim=-1, **kwargs):
+    def __init__(self, num_joints, rel_joints=False, dim_per_joint=6, out_dim=-1, ktree_parents=None, **kwargs):
         super().__init__()
+
+        if ktree_parents is None:
+            raise ValueError("HierarchicalPoseEncoder requires ktree_parents (e.g. metadata['joint_parents'])")
 
         self.num_joints = num_joints
         self.rel_joints = rel_joints
-        self.ktree_parents = np.array([-1,  0,  0,  0,  1,  2,  3,  4,  5,  6,  7,  8,
-            9,  9,  9, 12, 13, 14, 16, 17, 18, 19, 20, 21], dtype=np.int32)
+        self.ktree_parents = np.asarray(ktree_parents, dtype=np.int32)
 
         self.layer_0 = nn.Linear(9*num_joints + 3*num_joints, dim_per_joint)
         dim_feat = 13 + dim_per_joint

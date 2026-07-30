@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - dataset: zjumocap_377_mono
+  - dataset: zju_377_mhr
   - pose_correction: direct
   - texture: shallow_mlp
   - rigid: skinning_field
@@ -32,7 +32,6 @@ model:
 
 dataset:
   preload: true
-  train_smpl: false
 
   mode: ${mode}
   test_mode: view
