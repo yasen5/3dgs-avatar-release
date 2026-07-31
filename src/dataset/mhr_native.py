@@ -36,13 +36,10 @@ from torch.utils.data import Dataset
 
 from src.body_models import mhr_lbs
 from src.body_models.mhr_utils import build_big_pose_model_params, local_joint_rotmats
+from src.constants import CAMERAS_EXTENT, MHR_MODEL_PARAMS_DIM, MHR_SHAPE_DIM
 from src.scene.cameras import Camera
 from src.utils.dataset_utils import AABB, fetchPly, storePly
 from src.utils.graphics_utils import BasicPointCloud, focal2fov
-
-# Scene-scale constant (spatial_lr_scale / densify-threshold normalization) verified
-# to work well for this data scale; not a per-camera-rig quantity.
-CAMERAS_EXTENT = 3.469298553466797
 
 
 class MHRParms(TypedDict):
@@ -94,8 +91,8 @@ class MHRNativeDataset(Dataset[Camera]):
         self.split = split
         self.root_dir: str = cfg.root_dir
         self.white_bg: bool = cfg.white_background
-        self.device: str = cfg.get('mhr_device', 'cuda')
-        self.source_layout: str = cfg.get('source_layout', 'prepared')
+        self.device: str = cfg.mhr_device
+        self.source_layout: str = cfg.source_layout
 
         self.frame_ids: list[str] = []
         self._image_paths: dict[str, str] = {}
@@ -126,7 +123,7 @@ class MHRNativeDataset(Dataset[Camera]):
         self.metadata: MHRCanonicalMetadata | MHRMetadata
         self.get_metadata()
 
-        self.preload: bool = cfg.get('preload', True)
+        self.preload: bool = cfg.preload
         self.cameras: list[Camera] = []
         if self.preload:
             self.cameras = [self.getitem(idx) for idx in range(len(self))]
@@ -159,7 +156,7 @@ class MHRNativeDataset(Dataset[Camera]):
         the loader in the same camera-space convention as ``mhr_lbs.mhr_query``
         and avoids relying on the multi-view annots.npy extrinsics.
         """
-        camera_name = str(self.cfg.get('camera_name', 'Camera_B1'))
+        camera_name = str(self.cfg.camera_name)
         if not camera_name.startswith('Camera_B'):
             raise ValueError(
                 "dataset.camera_name must name one ZJU camera such as "
@@ -197,7 +194,7 @@ class MHRNativeDataset(Dataset[Camera]):
             raise FileNotFoundError(f"No MHR raw fits found in {raw_dir}")
 
         image_dir = os.path.join(self.camera_dir, 'images')
-        mask_dir = os.path.join(self.camera_dir, str(self.cfg.get('mask_dir', 'masks')))
+        mask_dir = os.path.join(self.camera_dir, str(self.cfg.mask_dir))
         frame_ids: list[str] = []
         shape_params: list[npt.NDArray[np.floating[Any]]] = []
         model_params: list[npt.NDArray[np.floating[Any]]] = []
@@ -223,7 +220,7 @@ class MHRNativeDataset(Dataset[Camera]):
                 shape = np.asarray(raw['shape_params'], dtype=np.float32).reshape(-1)
                 model = np.asarray(raw['mhr_model_params'], dtype=np.float32).reshape(-1)
                 translation = np.asarray(raw['pred_cam_t'], dtype=np.float32).reshape(-1)
-                if shape.shape != (45,) or model.shape != (204,) or translation.shape != (3,):
+                if shape.shape != (MHR_SHAPE_DIM,) or model.shape != (MHR_MODEL_PARAMS_DIM,) or translation.shape != (3,):
                     raise ValueError(
                         f"Unexpected MHR shapes in {raw_path}: shape={shape.shape}, "
                         f"model={model.shape}, cam_t={translation.shape}"
@@ -257,7 +254,7 @@ class MHRNativeDataset(Dataset[Camera]):
         # The current 377 preparation stores a per-frame SAM-3D shape fit.
         # Keeping those values reproduces the saved MHR vertices exactly;
         # shape.npy remains available for consumers that want a fixed identity.
-        shape_source = self.cfg.get('shape_source', 'raw')
+        shape_source = self.cfg.shape_source
         if shape_source not in ('raw', 'shape_npy'):
             raise ValueError(
                 "dataset.shape_source must be 'raw' or 'shape_npy', "
@@ -266,7 +263,7 @@ class MHRNativeDataset(Dataset[Camera]):
         if shape_source == 'shape_npy':
             shape_path = os.path.join(self.camera_dir, 'results', 'shape.npy')
             fixed_shape = np.asarray(np.load(shape_path), dtype=np.float32).reshape(-1)
-            if fixed_shape.shape != (45,):
+            if fixed_shape.shape != (MHR_SHAPE_DIM,):
                 raise ValueError(f"Unexpected shape.npy dimensions: {fixed_shape.shape}")
             shape_params = [fixed_shape.copy() for _ in frame_ids]
 
@@ -307,9 +304,9 @@ class MHRNativeDataset(Dataset[Camera]):
         centered = big_pose_verts - center
         cano_max = centered.max()
         cano_min = centered.min()
-        norm_padding = (cano_max - cano_min) * 0.05
+        norm_padding = (cano_max - cano_min) * self.cfg.canonical_norm_padding
         jtr_norm = big_pose_joint_pos.numpy() - center
-        jtr_norm = (jtr_norm - cano_min + norm_padding) / (cano_max - cano_min) / 1.1
+        jtr_norm = (jtr_norm - cano_min + norm_padding) / (cano_max - cano_min) / self.cfg.jtr_norm_scale
         jtr_norm -= 0.5
         jtr_norm *= 2.0
 
@@ -431,7 +428,7 @@ class MHRNativeDataset(Dataset[Camera]):
             verts = self.metadata['cano_verts']
             faces = self.faces
             mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-            n_points = 50_000
+            n_points = self.cfg.canonical_pointcloud_n_points
             xyz = mesh.sample(n_points)
             rgb = np.ones_like(xyz) * 255
             storePly(ply_path, xyz, rgb)

@@ -11,17 +11,6 @@ from src.dataset.mhr_native import MHRMetadata
 from src.scene.cameras import Camera
 
 
-class NoPoseCorrection(nn.Module):
-    def __init__(self, config: DictConfig, metadata: MHRMetadata | None = None) -> None:
-        super(NoPoseCorrection, self).__init__()
-
-    def forward(self, camera: Camera, iteration: int) -> tuple[Camera, dict[str, torch.Tensor]]:
-        return camera, {}
-
-    def regularization(self, out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return {}
-
-
 class DirectPoseOptimization(nn.Module):
     """`model_params` (204, the whole skeletal/articulated state --
     global_trans+global_rot+body_pose) is a learnable nn.Embedding per frame,
@@ -71,7 +60,7 @@ class DirectPoseOptimization(nn.Module):
         frame = camera.frame_id
         if frame not in self.frame_dict:
             return camera, {}
-        if iteration < self.config.get('delay', 0):
+        if iteration < self.config.delay:
             return camera, {}
 
         idx = torch.tensor([self.frame_dict[frame]], device=self.model_params.weight.device).long()
@@ -110,7 +99,6 @@ class DirectPoseOptimization(nn.Module):
 def get_pose_correction(cfg: DictConfig, metadata: MHRMetadata) -> nn.Module:
     name = cfg.name
     model_dict = {
-        "none": NoPoseCorrection,
-        "direct": DirectPoseOptimization,
+        "direct": DirectPoseOptimization,  # paper default
     }
     return model_dict[name](cfg, metadata)

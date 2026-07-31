@@ -15,3 +15,8 @@ model:
     view_noise: 45
 
     non_rigid_dim: 0
+
+opt:
+  texture_lr: 0.
+  tex_latent_lr: 0.
+  latent_weight_decay: 0.05

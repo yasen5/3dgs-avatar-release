@@ -25,17 +25,6 @@ class RigidDeform(nn.Module):
     def regularization(self) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
-class Identity(RigidDeform):
-    """ Identity mapping for single frame reconstruction """
-    def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
-        super().__init__(cfg)
-
-    def forward(self, gaussians: GaussianModel, iteration: int, camera: Camera) -> GaussianModel:
-        return gaussians
-
-    def regularization(self) -> dict[str, torch.Tensor]:
-        return {}
-
 def create_voxel_grid(d: int, h: int, w: int, device: str = 'cpu') -> torch.Tensor:
     x_range = (torch.linspace(-1,1,steps=w,device=device)).view(1, 1, 1, w).expand(1, d, h, w)  # [1, H, W, D]
     y_range = (torch.linspace(-1,1,steps=h,device=device)).view(1, 1, h, 1).expand(1, d, h, w)  # [1, H, W, D]
@@ -158,7 +147,6 @@ class SkinningField(RigidDeform):
 def get_rigid_deform(cfg: DictConfig, metadata: MHRMetadata) -> RigidDeform:
     name = cfg.name
     model_dict = {
-        "identity": Identity,
-        "skinning_field": SkinningField,
+        "skinning_field": SkinningField,  # paper default
     }
     return model_dict[name](cfg, metadata)

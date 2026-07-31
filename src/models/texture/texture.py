@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 
+from src.constants import COV_UPPER_TRI_DIM, DIR_NORM_EPS, GAUSSIAN_XYZ_DIM, RGB_DIM, SH_DC_OFFSET
 from src.dataset.mhr_native import MHRMetadata
 from src.scene.cameras import Camera
 from src.scene.gaussian_model import GaussianModel
@@ -33,16 +34,16 @@ class SH2RGB(ColorPrecompute):
             assert T_fwd is not None
             R_bwd = T_fwd[:, :3, :3].transpose(1, 2)
             dir_pp = torch.matmul(R_bwd, dir_pp.unsqueeze(-1)).squeeze(-1)
-            view_noise_scale = self.cfg.get('view_noise', 0.)
+            view_noise_scale = self.cfg.view_noise
             if self.training and view_noise_scale > 0.:
                 view_noise = torch.tensor(augm_rots(view_noise_scale, view_noise_scale, view_noise_scale),
                                           dtype=torch.float32,
                                           device=dir_pp.device).transpose(0, 1)
                 dir_pp = torch.matmul(dir_pp, view_noise)
 
-        dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-12)
+        dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + DIR_NORM_EPS)
         sh2rgb = eval_sh(gaussians.active_sh_degree, shs_view, dir_pp_normalized)
-        colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        colors_precomp = torch.clamp_min(sh2rgb + SH_DC_OFFSET, 0.0)
         return colors_precomp
 
 class ColorMLP(ColorPrecompute):
@@ -50,20 +51,20 @@ class ColorMLP(ColorPrecompute):
         super().__init__(cfg, metadata)
         d_in = cfg.feature_dim
 
-        self.use_xyz: bool = cfg.get('use_xyz', False)
-        self.use_cov: bool = cfg.get('use_cov', False)
-        self.use_normal: bool = cfg.get('use_normal', False)
-        self.sh_degree: int = cfg.get('sh_degree', 0)
-        self.cano_view_dir: bool = cfg.get('cano_view_dir', False)
-        self.non_rigid_dim: int = cfg.get('non_rigid_dim', 0)
-        self.latent_dim: int = cfg.get('latent_dim', 0)
+        self.use_xyz: bool = cfg.use_xyz
+        self.use_cov: bool = cfg.use_cov
+        self.use_normal: bool = cfg.use_normal
+        self.sh_degree: int = cfg.sh_degree
+        self.cano_view_dir: bool = cfg.cano_view_dir
+        self.non_rigid_dim: int = cfg.non_rigid_dim
+        self.latent_dim: int = cfg.latent_dim
 
         if self.use_xyz:
-            d_in += 3
+            d_in += GAUSSIAN_XYZ_DIM
         if self.use_cov:
-            d_in += 6 # only upper triangle suffice
+            d_in += COV_UPPER_TRI_DIM # only upper triangle suffice
         if self.use_normal:
-            d_in += 3 # quasi-normal by smallest eigenvector...
+            d_in += GAUSSIAN_XYZ_DIM # quasi-normal by smallest eigenvector...
         if self.sh_degree > 0:
             d_in += (self.sh_degree + 1) ** 2 - 1
             self.sh_embed = lambda dir: eval_sh_bases(self.sh_degree, dir)[..., 1:]
@@ -74,7 +75,7 @@ class ColorMLP(ColorPrecompute):
             self.frame_dict = metadata['frame_dict']
             self.latent = nn.Embedding(len(self.frame_dict), self.latent_dim)
 
-        d_out = 3
+        d_out = RGB_DIM
         self.mlp = VanillaCondMLP(d_in, 0, d_out, cfg.mlp)
         self.color_activation = nn.Sigmoid()
 
@@ -100,13 +101,13 @@ class ColorMLP(ColorPrecompute):
                 assert T_fwd is not None
                 R_bwd = T_fwd[:, :3, :3].transpose(1, 2)
                 dir_pp = torch.matmul(R_bwd, dir_pp.unsqueeze(-1)).squeeze(-1)
-                view_noise_scale = self.cfg.get('view_noise', 0.)
+                view_noise_scale = self.cfg.view_noise
                 if self.training and view_noise_scale > 0.:
                     view_noise = torch.tensor(augm_rots(view_noise_scale, view_noise_scale, view_noise_scale),
                                               dtype=torch.float32,
                                               device=dir_pp.device).transpose(0, 1)
                     dir_pp = torch.matmul(dir_pp, view_noise)
-            dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-12)
+            dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + DIR_NORM_EPS)
             dir_embed = self.sh_embed(dir_pp_normalized)
             features = torch.cat([features, dir_embed], dim=1)
         if self.non_rigid_dim > 0:
@@ -137,6 +138,6 @@ def get_texture(cfg: DictConfig, metadata: MHRMetadata) -> ColorPrecompute:
     name = cfg.name
     model_dict = {
         "sh2rgb": SH2RGB,
-        "mlp": ColorMLP,
+        "mlp": ColorMLP,  # paper default (via the "shallow_mlp" config preset)
     }
     return model_dict[name](cfg, metadata)

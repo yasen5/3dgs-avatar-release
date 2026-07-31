@@ -1,7 +1,0 @@
-# @package _global_
-
-pose_name: none
-
-model:
-  pose_correction:
-    name: none

@@ -64,7 +64,7 @@ class Scene:
         self.converter.eval()
 
     def optimize(self, iteration: int) -> None:
-        gaussians_delay = self.cfg.model.gaussian.get('delay', 0)
+        gaussians_delay = self.cfg.model.gaussian.delay
         if iteration >= gaussians_delay:
             assert self.gaussians.optimizer is not None
             self.gaussians.optimizer.step()

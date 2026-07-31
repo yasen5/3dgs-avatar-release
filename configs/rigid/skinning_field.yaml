@@ -20,6 +20,7 @@ model:
         skip_in: []
         cond_in: []
         multires: 0
+        last_layer_init: false
 
 opt:
   lambda_skinning: [10,1000,0.1]

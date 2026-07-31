@@ -5,6 +5,13 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 
+from src.constants import (
+    GAUSSIAN_ROT_DIM,
+    GAUSSIAN_SCALE_DIM,
+    GAUSSIAN_XYZ_DIM,
+    QUATERNION_IDENTITY_W,
+    SCALE_EXP_MIN_EPS,
+)
 from src.dataset.mhr_native import MHRMetadata
 from src.models.network_utils import (
     HannwCondMLP,
@@ -27,15 +34,6 @@ class NonRigidDeform(nn.Module):
     ) -> tuple[GaussianModel, dict[str, torch.Tensor]]:
         raise NotImplementedError
 
-class Identity(NonRigidDeform):
-    def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
-        super().__init__(cfg)
-
-    def forward(
-        self, gaussians: GaussianModel, iteration: int, camera: Camera, compute_loss: bool = True
-    ) -> tuple[GaussianModel, dict[str, torch.Tensor]]:
-        return gaussians, {}
-
 class MLP(NonRigidDeform):
     def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
         super().__init__(cfg)
@@ -43,22 +41,22 @@ class MLP(NonRigidDeform):
         d_cond = self.pose_encoder.n_output_dims
 
         # add latent code
-        self.latent_dim: int = cfg.get('latent_dim', 0)
+        self.latent_dim: int = cfg.latent_dim
         if self.latent_dim > 0:
             d_cond += self.latent_dim
             self.frame_dict = metadata['frame_dict']
             self.latent = nn.Embedding(len(self.frame_dict), self.latent_dim)
 
-        d_in = 3
-        d_out = 3 + 3 + 4
-        self.feature_dim: int = cfg.get('feature_dim', 0)
+        d_in = GAUSSIAN_XYZ_DIM
+        d_out = GAUSSIAN_XYZ_DIM + GAUSSIAN_SCALE_DIM + GAUSSIAN_ROT_DIM
+        self.feature_dim: int = cfg.feature_dim
         d_out += self.feature_dim
 
         # output dimension: position + scale + rotation
         self.mlp = VanillaCondMLP(d_in, d_cond, d_out, cfg.mlp)
         self.aabb = metadata['aabb']
 
-        self.delay: int = cfg.get('delay', 0)
+        self.delay: int = cfg.delay
 
 
     def forward(
@@ -96,23 +94,23 @@ class MLP(NonRigidDeform):
 
         deformed_gaussians._xyz = gaussians._xyz + delta_xyz
 
-        scale_offset = self.cfg.get('scale_offset', 'logit')
+        scale_offset = self.cfg.scale_offset
         if scale_offset == 'logit':
             deformed_gaussians._scaling = gaussians._scaling + delta_scale
         elif scale_offset == 'exp':
-            deformed_gaussians._scaling = torch.log(torch.clamp_min(gaussians.get_scaling + delta_scale, 1e-6))
+            deformed_gaussians._scaling = torch.log(torch.clamp_min(gaussians.get_scaling + delta_scale, SCALE_EXP_MIN_EPS))
         elif scale_offset == 'zero':
             delta_scale = torch.zeros_like(delta_scale)
             deformed_gaussians._scaling = gaussians._scaling
         else:
             raise ValueError
 
-        rot_offset = self.cfg.get('rot_offset', 'add')
+        rot_offset = self.cfg.rot_offset
         if rot_offset == 'add':
             deformed_gaussians._rotation = gaussians._rotation + delta_rot
         elif rot_offset == 'mult':
             q1 = delta_rot
-            q1[:, 0] = 1. # [1,0,0,0] represents identity rotation
+            q1[:, 0] = QUATERNION_IDENTITY_W # [1,0,0,0] represents identity rotation
             delta_rot = delta_rot[:, 1:]
             q2 = gaussians._rotation
             # deformed_gaussians._rotation = quaternion_multiply(q1, q2)
@@ -144,7 +142,10 @@ class HannwMLP(NonRigidDeform):
         super().__init__(cfg)
         self.pose_encoder = HierarchicalPoseEncoder(**cfg.pose_encoder, ktree_parents=metadata['joint_parents'])
         # output dimension: position + scale + rotation
-        self.mlp = HannwCondMLP(3, self.pose_encoder.n_output_dims, 3 + 3 + 4, cfg.mlp, dim_coord=3)
+        self.mlp = HannwCondMLP(
+            GAUSSIAN_XYZ_DIM, self.pose_encoder.n_output_dims,
+            GAUSSIAN_XYZ_DIM + GAUSSIAN_SCALE_DIM + GAUSSIAN_ROT_DIM, cfg.mlp, dim_coord=GAUSSIAN_XYZ_DIM,
+        )
         self.aabb = metadata['aabb']
 
 
@@ -169,23 +170,23 @@ class HannwMLP(NonRigidDeform):
 
         deformed_gaussians._xyz = gaussians._xyz + delta_xyz
 
-        scale_offset = self.cfg.get('scale_offset', 'logit')
+        scale_offset = self.cfg.scale_offset
         if scale_offset == 'logit':
             deformed_gaussians._scaling = gaussians._scaling + delta_scale
         elif scale_offset == 'exp':
-            deformed_gaussians._scaling = torch.log(torch.clamp_min(gaussians.get_scaling + delta_scale, 1e-6))
+            deformed_gaussians._scaling = torch.log(torch.clamp_min(gaussians.get_scaling + delta_scale, SCALE_EXP_MIN_EPS))
         elif scale_offset == 'zero':
             delta_scale = torch.zeros_like(delta_scale)
             deformed_gaussians._scaling = gaussians._scaling
         else:
             raise ValueError
 
-        rot_offset = self.cfg.get('rot_offset', 'add')
+        rot_offset = self.cfg.rot_offset
         if rot_offset == 'add':
             deformed_gaussians._rotation = gaussians._rotation + delta_rot
         elif rot_offset == 'mult':
             q1 = delta_rot
-            q1[:, 0] = 1.  # [1,0,0,0] represents identity rotation
+            q1[:, 0] = QUATERNION_IDENTITY_W  # [1,0,0,0] represents identity rotation
             delta_rot = delta_rot[:, 1:]
             q2 = gaussians._rotation
             deformed_gaussians._rotation = quaternion_multiply(q1, q2)
@@ -214,21 +215,21 @@ class HashGridwithMLP(NonRigidDeform):
         d_cond = self.pose_encoder.n_output_dims
 
         # add latent code
-        self.latent_dim: int = cfg.get('latent_dim', 0)
+        self.latent_dim: int = cfg.latent_dim
         if self.latent_dim > 0:
             d_cond += self.latent_dim
             self.frame_dict = metadata['frame_dict']
             self.latent = nn.Embedding(len(self.frame_dict), self.latent_dim)
 
-        d_out = 3 + 3 + 4
-        self.feature_dim: int = cfg.get('feature_dim', 0)
+        d_out = GAUSSIAN_XYZ_DIM + GAUSSIAN_SCALE_DIM + GAUSSIAN_ROT_DIM
+        self.feature_dim: int = cfg.feature_dim
         d_out += self.feature_dim
 
         self.aabb = metadata['aabb']
         self.hashgrid = HashGrid(cfg.hashgrid)
         self.mlp = VanillaCondMLP(self.hashgrid.n_output_dims, d_cond, d_out, cfg.mlp)
 
-        self.delay: int = cfg.get('delay', 0)
+        self.delay: int = cfg.delay
 
     def forward(
         self, gaussians: GaussianModel, iteration: int, camera: Camera, compute_loss: bool = True
@@ -268,23 +269,23 @@ class HashGridwithMLP(NonRigidDeform):
 
         deformed_gaussians._xyz = gaussians._xyz + delta_xyz
 
-        scale_offset = self.cfg.get('scale_offset', 'logit')
+        scale_offset = self.cfg.scale_offset
         if scale_offset == 'logit':
             deformed_gaussians._scaling = gaussians._scaling + delta_scale
         elif scale_offset == 'exp':
-            deformed_gaussians._scaling = torch.log(torch.clamp_min(gaussians.get_scaling + delta_scale, 1e-6))
+            deformed_gaussians._scaling = torch.log(torch.clamp_min(gaussians.get_scaling + delta_scale, SCALE_EXP_MIN_EPS))
         elif scale_offset == 'zero':
             delta_scale = torch.zeros_like(delta_scale)
             deformed_gaussians._scaling = gaussians._scaling
         else:
             raise ValueError
 
-        rot_offset = self.cfg.get('rot_offset', 'add')
+        rot_offset = self.cfg.rot_offset
         if rot_offset == 'add':
             deformed_gaussians._rotation = gaussians._rotation + delta_rot
         elif rot_offset == 'mult':
             q1 = delta_rot
-            q1[:, 0] = 1.  # [1,0,0,0] represents identity rotation
+            q1[:, 0] = QUATERNION_IDENTITY_W  # [1,0,0,0] represents identity rotation
             delta_rot = delta_rot[:, 1:]
             q2 = gaussians._rotation
             # deformed_gaussians._rotation = quaternion_multiply(q1, q2)
@@ -313,9 +314,8 @@ class HashGridwithMLP(NonRigidDeform):
 def get_non_rigid_deform(cfg: DictConfig, metadata: MHRMetadata) -> NonRigidDeform:
     name = cfg.name
     model_dict = {
-        "identity": Identity,
         "mlp": MLP,
         "hannw_mlp": HannwMLP,
-        "hashgrid": HashGridwithMLP,
+        "hashgrid": HashGridwithMLP,  # paper default
     }
     return model_dict[name](cfg, metadata)

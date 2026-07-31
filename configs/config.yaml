@@ -22,16 +22,13 @@ model:
     use_sh: true
     sh_degree: 3
     delay: 1000
+    init_opacity: 0.1
   pose_correction:
     name: direct
-  deformer:
-    rigid:
-      name: identity
-    non_rigid:
-      name: identity
 
 dataset:
   preload: true
+  source_layout: prepared
 
   mode: ${mode}
   test_mode: view
@@ -43,6 +40,10 @@ dataset:
   white_background: false
   data_device: cuda
   eval: false
+
+  canonical_norm_padding: 0.05
+  jtr_norm_scale: 1.1
+  canonical_pointcloud_n_points: 50000
 
 opt:
   iterations: 60000
@@ -57,6 +58,7 @@ opt:
   opacity_lr: 0.05
   scaling_lr: 0.005
   rotation_lr: 0.001
+  sh_feature_rest_lr_ratio: 20.0
 
   pose_correction_lr: 1e-4
   rigid_lr: 1e-4
@@ -64,6 +66,7 @@ opt:
   lr_ratio: 0.01
 
   # loss weights
+  lpips_type: vgg
   lambda_l1: 1.
   lambda_dssim: 0.
   lambda_perceptual: 1e-2
@@ -84,6 +87,12 @@ opt:
   densify_until_iter: 45000
   densify_grad_threshold: 0.0002
   opacity_threshold: 0.05
+  opacity_reset_value: 0.01
+  densify_split_n: 2
+  densify_split_scale_factor: 0.8
+  prune_big_point_ws_ratio: 0.1
+  sh_degree_up_interval: 1000
+  densify_screen_size_threshold: 20
 
 pipeline:
   convert_SHs_python: true
@@ -91,6 +100,7 @@ pipeline:
   debug: false
 
   pose_noise: 0.1
+  pose_noise_apply_prob: 0.5
 
 debug_from: -1
 detect_anomaly: false

@@ -29,3 +29,4 @@ opt:
   lambda_nr_scale: 0.
   lambda_nr_rot: 0.
   non_rigid_lr: 0.001
+  nr_latent_lr: 0.  # HannwMLP has no latent embedding, so this group is always empty

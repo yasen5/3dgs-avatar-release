@@ -12,6 +12,14 @@ from __future__ import annotations
 
 import torch
 
+from src.constants import (
+    BIG_POSE_ARM_DIMS,
+    BIG_POSE_DELTA,
+    BIG_POSE_LEG_DIMS,
+    BIG_POSE_ZERO_PREFIX_LEN,
+    BODY_POSE_OFFSET,
+)
+
 # Empirically-found "big pose" (SMPL star/Vitruvian-pose analogue) dims in MHR's
 # 204-dim model_params vector: global_trans(3) + global_rot(3) + body_pose(198),
 # so +6 offsets into body_pose, delta 0.6 -- found by finite-differencing which
@@ -37,16 +45,14 @@ import torch
 # collision between the left/right leg surfaces, 0/3579 vertices cross
 # sides, ~7.7cm minimum surface gap) while abducting into a clean
 # star/Vitruvian pose.
-BIG_POSE_ARM_DIMS = [24, 34]
-BIG_POSE_LEG_DIMS = [45, 54]
-BIG_POSE_DELTA = 0.6
+# (BIG_POSE_ARM_DIMS, BIG_POSE_LEG_DIMS, BIG_POSE_DELTA live in src/constants.py)
 
 
 def build_big_pose_model_params(reference_model_params: torch.Tensor) -> torch.Tensor:
     mp = reference_model_params.clone()
-    mp[:136] = 0.0
+    mp[:BIG_POSE_ZERO_PREFIX_LEN] = 0.0
     for dim in BIG_POSE_ARM_DIMS + BIG_POSE_LEG_DIMS:
-        mp[6 + dim] = -BIG_POSE_DELTA
+        mp[BODY_POSE_OFFSET + dim] = -BIG_POSE_DELTA
     return mp
 
 

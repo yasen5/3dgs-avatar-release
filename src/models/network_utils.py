@@ -10,6 +10,8 @@ import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from typing_extensions import TypeAlias
 
+from src.constants import JOINT_FEAT_BASE_DIM, JOINT_POS_DIM, LAST_LAYER_INIT_STD, ROTMAT_FLAT_DIM, SKIP_CONNECTION_SCALE
+
 ConfigPrimitive: TypeAlias = Union[
     "dict[str, ConfigPrimitive]", "list[ConfigPrimitive]", str, int, float, bool, None
 ]
@@ -187,9 +189,9 @@ class HierarchicalPoseEncoder(nn.Module):
         self,
         num_joints: int,
         ktree_parents: npt.NDArray[np.integer[Any]],
-        rel_joints: bool = False,
-        dim_per_joint: int = 6,
-        out_dim: int = -1,
+        rel_joints: bool,
+        dim_per_joint: int,
+        out_dim: int,
     ) -> None:
         super().__init__()
 
@@ -197,8 +199,8 @@ class HierarchicalPoseEncoder(nn.Module):
         self.rel_joints = rel_joints
         self.ktree_parents = np.asarray(ktree_parents, dtype=np.int32)
 
-        self.layer_0 = nn.Linear(9*num_joints + 3*num_joints, dim_per_joint)
-        dim_feat = 13 + dim_per_joint
+        self.layer_0 = nn.Linear(ROTMAT_FLAT_DIM*num_joints + JOINT_POS_DIM*num_joints, dim_per_joint)
+        dim_feat = JOINT_FEAT_BASE_DIM + dim_per_joint
 
         layers = []
         for idx in range(num_joints):
@@ -266,7 +268,7 @@ class VanillaCondMLP(nn.Module):
             self.embed_fn = embed_fn
             dims[0] = input_ch
 
-        self.last_layer_init = config.get('last_layer_init', False)
+        self.last_layer_init = config.last_layer_init
 
         self.num_layers = len(dims)
 
@@ -282,7 +284,7 @@ class VanillaCondMLP(nn.Module):
                 lin = nn.Linear(dims[l], out_dim)
 
             if self.last_layer_init and l == self.num_layers - 2:
-                torch.nn.init.normal_(lin.weight, mean=0., std=1e-5)
+                torch.nn.init.normal_(lin.weight, mean=0., std=LAST_LAYER_INIT_STD)
                 torch.nn.init.constant_(lin.bias, val=0.)
 
 
@@ -309,7 +311,7 @@ class VanillaCondMLP(nn.Module):
                 x = torch.cat([x, cond], 1)
 
             if l in self.config.skip_in:
-                x = torch.cat([x, coords_embedded], 1) / np.sqrt(2)
+                x = torch.cat([x, coords_embedded], 1) * SKIP_CONNECTION_SCALE
 
             x = lin(x)
 
@@ -386,7 +388,7 @@ class HannwCondMLP(nn.Module):
                 x = torch.cat([x, cond], 1)
 
             if l in self.config.skip_in:
-                x = torch.cat([x, coords_embedded], 1) / np.sqrt(2)
+                x = torch.cat([x, coords_embedded], 1) * SKIP_CONNECTION_SCALE
 
             x = lin(x)
 
@@ -401,7 +403,7 @@ def config_to_primitive(config: DictConfig, resolve: bool = True) -> ConfigPrimi
 class HashGrid(nn.Module):
     def __init__(self, config: DictConfig) -> None:
         super().__init__()
-        xL = config.get('max_resolution', -1)
+        xL = config.max_resolution
         if xL > 0:
             L = config.n_levels
             x0 = config.base_resolution

@@ -26,6 +26,7 @@ model:
       skip_in: []
       cond_in: []
       multires: 0
+      last_layer_init: false
 
 opt:
   feature_lr: 1e-3

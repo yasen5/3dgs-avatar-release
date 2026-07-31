@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 
+from src.constants import ADAM_EPS
 from src.dataset.mhr_native import MHRMetadata
 from src.scene.cameras import Camera
 from src.scene.gaussian_model import GaussianModel
@@ -28,19 +29,19 @@ class GaussianConverter(nn.Module):
 
     def set_optimizer(self) -> None:
         opt_params = [
-            {'params': self.deformer.rigid.parameters(), 'lr': self.cfg.opt.get('rigid_lr', 0.)},
-            # {'params': self.deformer.non_rigid.parameters(), 'lr': self.cfg.opt.get('non_rigid_lr', 0.)},
+            {'params': self.deformer.rigid.parameters(), 'lr': self.cfg.opt.rigid_lr},
             {'params': [p for n, p in self.deformer.non_rigid.named_parameters() if 'latent' not in n],
-             'lr': self.cfg.opt.get('non_rigid_lr', 0.)},
+             'lr': self.cfg.opt.non_rigid_lr},
             {'params': [p for n, p in self.deformer.non_rigid.named_parameters() if 'latent' in n],
-             'lr': self.cfg.opt.get('nr_latent_lr', 0.), 'weight_decay': self.cfg.opt.get('latent_weight_decay', 0.05)},
-            {'params': self.pose_correction.parameters(), 'lr': self.cfg.opt.get('pose_correction_lr', 0.)},
+             'lr': self.cfg.opt.nr_latent_lr, 'weight_decay': self.cfg.opt.latent_weight_decay},
+            {'params': self.pose_correction.parameters(), 'lr': self.cfg.opt.pose_correction_lr},
             {'params': [p for n, p in self.texture.named_parameters() if 'latent' not in n],
-             'lr': self.cfg.opt.get('texture_lr', 0.)},
+             'lr': self.cfg.opt.texture_lr},
             {'params': [p for n, p in self.texture.named_parameters() if 'latent' in n],
-             'lr': self.cfg.opt.get('tex_latent_lr', 0.), 'weight_decay': self.cfg.opt.get('latent_weight_decay', 0.05)},
+             'lr': self.cfg.opt.tex_latent_lr, 'weight_decay': self.cfg.opt.latent_weight_decay},
         ]
-        self.optimizer = torch.optim.Adam(params=opt_params, lr=0.001, eps=1e-15)
+        # every param group above sets its own 'lr', so Adam's top-level lr is never used
+        self.optimizer = torch.optim.Adam(params=opt_params, lr=0., eps=ADAM_EPS)
 
         gamma = self.cfg.opt.lr_ratio ** (1. / self.cfg.opt.iterations)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
@@ -53,8 +54,8 @@ class GaussianConverter(nn.Module):
         camera, loss_reg_pose = self.pose_correction(camera, iteration)
 
         # pose augmentation
-        pose_noise = self.cfg.pipeline.get('pose_noise', 0.)
-        if self.training and pose_noise > 0 and np.random.uniform() <= 0.5:
+        pose_noise = self.cfg.pipeline.pose_noise
+        if self.training and pose_noise > 0 and np.random.uniform() <= self.cfg.pipeline.pose_noise_apply_prob:
             camera = camera.copy()
             camera.rots = camera.rots + torch.randn(camera.rots.shape, device=camera.rots.device) * pose_noise
 
@@ -68,7 +69,7 @@ class GaussianConverter(nn.Module):
         return deformed_gaussians, loss_reg, color_precompute
 
     def optimize(self) -> None:
-        grad_clip = self.cfg.opt.get('grad_clip', 0.)
+        grad_clip = self.cfg.opt.grad_clip
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
         self.optimizer.step()

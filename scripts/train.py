@@ -28,6 +28,13 @@ import wandb
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from tqdm import tqdm
 
+from src.constants import (
+    LOSS_EMA_ALPHA,
+    MASK_LOSS_BCE_EPS,
+    PROGRESS_BAR_PRECISION,
+    PROGRESS_BAR_UPDATE_INTERVAL,
+    TRAIN_VAL_SUBSAMPLE_STRIDE,
+)
 from src.gaussian_renderer import render
 from src.scene import GaussianModel, Scene
 from src.utils.general_utils import PSEvaluator
@@ -64,7 +71,7 @@ def training(config: DictConfig) -> None:
     debug_from = config.debug_from
 
     # define lpips
-    lpips_type = config.opt.get('lpips_type', 'vgg')
+    lpips_type = config.opt.lpips_type
     loss_fn_vgg = lpips.LPIPS(net=lpips_type).cuda() # for training
     evaluator = PSEvaluator()
 
@@ -93,8 +100,8 @@ def training(config: DictConfig) -> None:
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        # Periodically increase the levels of SH up to a maximum degree
+        if iteration % opt.sh_degree_up_interval == 0:
             gaussians.oneupSHdegree()
 
         # Pick a random data point
@@ -128,7 +135,7 @@ def training(config: DictConfig) -> None:
         loss = lambda_l1 * loss_l1 + lambda_dssim * loss_dssim
 
         # perceptual loss
-        lambda_perceptual = retrieve_scheduled_value(iteration, config.opt.get('lambda_perceptual', 0.))
+        lambda_perceptual = retrieve_scheduled_value(iteration, config.opt.lambda_perceptual)
         if lambda_perceptual > 0:
             # crop the foreground
             mask = data.original_mask.cpu().numpy()
@@ -149,7 +156,7 @@ def training(config: DictConfig) -> None:
             loss_mask = torch.tensor(0.).cuda()
         elif config.opt.mask_loss_type == 'bce':
             assert opacity is not None
-            opacity = torch.clamp(opacity, 1.e-3, 1.-1.e-3)
+            opacity = torch.clamp(opacity, MASK_LOSS_BCE_EPS, 1.-MASK_LOSS_BCE_EPS)
             loss_mask = F.binary_cross_entropy(opacity, gt_mask)
         elif config.opt.mask_loss_type == 'l1':
             assert opacity is not None
@@ -166,8 +173,8 @@ def training(config: DictConfig) -> None:
         else:
             loss_skinning = torch.tensor(0.).cuda()
 
-        lambda_aiap_xyz = retrieve_scheduled_value(iteration, config.opt.get('lambda_aiap_xyz', 0.))
-        lambda_aiap_cov = retrieve_scheduled_value(iteration, config.opt.get('lambda_aiap_cov', 0.))
+        lambda_aiap_xyz = retrieve_scheduled_value(iteration, config.opt.lambda_aiap_xyz)
+        lambda_aiap_cov = retrieve_scheduled_value(iteration, config.opt.lambda_aiap_cov)
         if lambda_aiap_xyz > 0. or lambda_aiap_cov > 0.:
             aiap = full_aiap_loss(scene.gaussians, render_pkg["deformed_gaussian"])
             loss_aiap_xyz, loss_aiap_cov = aiap.xyz, aiap.covariance
@@ -180,7 +187,7 @@ def training(config: DictConfig) -> None:
         # regularization
         loss_reg = render_pkg["loss_reg"]
         for name, value in loss_reg.items():
-            lbd = opt.get(f"lambda_{name}", 0.)
+            lbd = opt[f"lambda_{name}"]
             lbd = retrieve_scheduled_value(iteration, lbd)
             loss += lbd * value
         loss.backward()
@@ -207,10 +214,10 @@ def training(config: DictConfig) -> None:
             wandb.log(log_loss)
 
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
+            ema_loss_for_log = LOSS_EMA_ALPHA * loss.item() + (1 - LOSS_EMA_ALPHA) * ema_loss_for_log
+            if iteration % PROGRESS_BAR_UPDATE_INTERVAL == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{PROGRESS_BAR_PRECISION}f}"})
+                progress_bar.update(PROGRESS_BAR_UPDATE_INTERVAL)
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -227,7 +234,7 @@ def training(config: DictConfig) -> None:
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    size_threshold = opt.densify_screen_size_threshold if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt, scene, size_threshold)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
@@ -266,7 +273,7 @@ def validation(
     torch.cuda.empty_cache()
     validation_configs: tuple[ValidationConfig, ValidationConfig] = (
         {'name': 'test', 'cameras': list(range(len(scene.test_dataset)))},
-        {'name': 'train', 'cameras': [idx for idx in range(0, len(scene.train_dataset), len(scene.train_dataset) // 10)]},
+        {'name': 'train', 'cameras': [idx for idx in range(0, len(scene.train_dataset), len(scene.train_dataset) // TRAIN_VAL_SUBSAMPLE_STRIDE)]},
     )
 
     for val_config in validation_configs:
