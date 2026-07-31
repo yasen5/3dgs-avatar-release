@@ -15,6 +15,10 @@ dataset:
 
   mhr_model_path: "/mnt/ssd2/sam4d_body_checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt"
   mhr_device: cuda
+  # Real frame-holdout split (see mhr_native.py's _load_zju_mocap_source):
+  # every test_every-th frame goes to val/test, the rest to train. Previously
+  # unset, so train and val/test loaded the identical full 570-frame set.
+  test_every: 5
 
   preload: false
   padding: 0.1

@@ -337,18 +337,31 @@ class MHRNativeDataset(Dataset[Camera]):
                 raise ValueError(f"Unexpected shape.npy dimensions: {fixed_shape.shape}")
             shape_params = [fixed_shape.copy() for _ in frame_ids]
 
+        # Real frame-holdout split: every cfg.test_every-th frame (by sorted
+        # frame index) is held out for val/test, the rest is train. Previously
+        # this method ignored self.split entirely, so train and val/test both
+        # loaded the identical full frame set -- not a genuine split.
+        test_every = int(self.cfg.test_every)
+        is_test = [i % test_every == 0 for i in range(len(frame_ids))]
+        keep = [not t for t in is_test] if self.split == 'train' else is_test
+
+        def _select(values: list) -> list:
+            return [v for v, k in zip(values, keep) if k]
+
         self.data_dir = self.camera_dir
-        self.frame_ids = frame_ids
+        self.frame_ids = _select(frame_ids)
         self.parms = {
-            'shape_params': torch.from_numpy(np.stack(shape_params)),
-            'model_params': torch.from_numpy(np.stack(model_params)),
-            'cam_t': torch.from_numpy(np.stack(cam_t)),
-            'focal_length': torch.tensor(focal_lengths, dtype=torch.float32),
-            'width': torch.tensor(widths, dtype=torch.long),
-            'height': torch.tensor(heights, dtype=torch.long),
-            'frame_ids': frame_ids,
+            'shape_params': torch.from_numpy(np.stack(_select(shape_params))),
+            'model_params': torch.from_numpy(np.stack(_select(model_params))),
+            'cam_t': torch.from_numpy(np.stack(_select(cam_t))),
+            'focal_length': torch.tensor(_select(focal_lengths), dtype=torch.float32),
+            'width': torch.tensor(_select(widths), dtype=torch.long),
+            'height': torch.tensor(_select(heights), dtype=torch.long),
+            'frame_ids': self.frame_ids,
         }
-        self.is_keyframe = np.zeros(len(frame_ids), dtype=bool)
+        self._image_paths = {f: self._image_paths[f] for f in self.frame_ids}
+        self._mask_paths = {f: self._mask_paths[f] for f in self.frame_ids}
+        self.is_keyframe = np.zeros(len(self.frame_ids), dtype=bool)
 
     def get_metadata(self) -> None:
         model_params_all = self.parms["model_params"].float()  # (N,204)

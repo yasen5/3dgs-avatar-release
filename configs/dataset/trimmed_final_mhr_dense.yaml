@@ -1,0 +1,20 @@
+# @package _global_
+# trimmed_final.mp4, MHR-native track, dense per-frame variant: reads the
+# output of pipelines/texture_appearance/threedgs_avatar_mhr/
+# prepare_mhr_dense_track.py, which runs SAM-3D-Body on every frame (no
+# keyframe interpolation) and uses Sapiens2 person masks, unlike
+# trimmed_final_mhr.yaml's prepare_mhr_keyframe_track.py-based data.
+
+dataset_name: trimmed_final_mhr_dense
+
+dataset:
+  name: mhr_native
+  root_dir: "/mnt/ssd2/tdgs_avatar_runs/mhr_native_trimmed_final_dense"
+  mhr_model_path: "/mnt/ssd2/sam4d_body_checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt"
+  mhr_device: cuda
+
+  padding: 0.1
+  resolution: -1
+  white_background: false
+  data_device: cuda
+  eval: true

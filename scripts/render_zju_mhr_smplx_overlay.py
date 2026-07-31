@@ -171,10 +171,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def numeric_frame_id(path: Path) -> int:
+    """Parses ZJU-style numeric stems ("000123") and the "frameNNNNNN" stems
+    written by prepare_mhr_keyframe_track.py / prepare_mhr_dense_track.py."""
+    stem = path.stem
+    digits = stem[len("frame"):] if stem.startswith("frame") else stem
     try:
-        return int(path.stem)
+        return int(digits)
     except ValueError as exc:
-        raise ValueError(f"Expected numeric ZJU frame filename, got {path.name}") from exc
+        raise ValueError(f"Expected numeric ZJU or 'frameNNNNNN' filename, got {path.name}") from exc
 
 
 def raw_fit_paths(raw_dir: Path) -> List[Path]:
