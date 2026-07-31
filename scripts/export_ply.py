@@ -9,21 +9,23 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import torch
-from src.scene import Scene, GaussianModel
-
 import hydra
-from omegaconf import OmegaConf
+import torch
+from omegaconf import DictConfig, OmegaConf
+
+from src.scene import GaussianModel, Scene
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
-def main(config):
+def main(config: DictConfig) -> None:
     OmegaConf.set_struct(config, False)
     config.dataset.preload = False
     config.exp_dir = config.get('exp_dir') or os.path.join('./exp', config.name)
@@ -48,7 +50,8 @@ def main(config):
             # generic viewers; the exact latent features are saved alongside
             # it so the real model can still be reconstructed exactly.
             view = None
-            for cand in scene.test_dataset:
+            for cand_idx in range(len(scene.test_dataset)):
+                cand = scene.test_dataset[cand_idx]
                 if cand.image_name == color_ref_view:
                     view = cand
                     break

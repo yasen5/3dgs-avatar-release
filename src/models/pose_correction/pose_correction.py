@@ -1,19 +1,24 @@
+from __future__ import annotations
+
 import numpy as np
 import torch
 import torch.nn as nn
+from omegaconf import DictConfig
 
 from src.body_models import mhr_lbs
 from src.body_models.mhr_utils import local_joint_rotmats
+from src.dataset.mhr_native import MHRMetadata
+from src.scene.cameras import Camera
 
 
 class NoPoseCorrection(nn.Module):
-    def __init__(self, config, metadata=None):
+    def __init__(self, config: DictConfig, metadata: MHRMetadata | None = None) -> None:
         super(NoPoseCorrection, self).__init__()
 
-    def forward(self, camera, iteration):
+    def forward(self, camera: Camera, iteration: int) -> tuple[Camera, dict[str, torch.Tensor]]:
         return camera, {}
 
-    def regularization(self, out):
+    def regularization(self, out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {}
 
 
@@ -34,8 +39,16 @@ class DirectPoseOptimization(nn.Module):
     forward pass for a negligible benefit.
     """
 
-    def __init__(self, config, metadata=None):
+    joint_parents: torch.Tensor
+    big_pose_joint_pos: torch.Tensor
+    big_pose_joint_rotmat: torch.Tensor
+    shape_params_all: torch.Tensor
+    cam_t_all: torch.Tensor
+    model_params_init: torch.Tensor
+
+    def __init__(self, config: DictConfig, metadata: MHRMetadata | None = None) -> None:
         super(DirectPoseOptimization, self).__init__()
+        assert metadata is not None
         self.config = config
         self.frame_dict = metadata['frame_dict']
 
@@ -44,7 +57,7 @@ class DirectPoseOptimization(nn.Module):
         # TorchScript module as a submodule -- it would otherwise show up in
         # self.parameters() (used both for the optimizer's param group and
         # for grad-clipping) as several hundred inert always-zero-grad tensors.
-        self._mhr_model = [metadata['mhr_model']]
+        self._mhr_model: list[torch.jit.ScriptModule] = [metadata['mhr_model']]
 
         self.register_buffer('joint_parents', torch.from_numpy(np.asarray(metadata['joint_parents'])).long())
         self.register_buffer('big_pose_joint_pos', metadata['big_pose_joint_pos'].clone())
@@ -52,9 +65,9 @@ class DirectPoseOptimization(nn.Module):
         self.register_buffer('shape_params_all', metadata['shape_params_all'].clone())
         self.register_buffer('cam_t_all', metadata['cam_t_all'].clone())
         self.register_buffer('model_params_init', metadata['model_params_all'].clone())
-        self.model_params = nn.Embedding.from_pretrained(metadata['model_params_all'].clone(), freeze=False)
+        self.model_params: nn.Embedding = nn.Embedding.from_pretrained(metadata['model_params_all'].clone(), freeze=False)
 
-    def forward(self, camera, iteration):
+    def forward(self, camera: Camera, iteration: int) -> tuple[Camera, dict[str, torch.Tensor]]:
         frame = camera.frame_id
         if frame not in self.frame_dict:
             return camera, {}
@@ -66,7 +79,7 @@ class DirectPoseOptimization(nn.Module):
         model_params = self.model_params(idx)  # (1,204), learnable
         cam_t = self.cam_t_all[idx][0]  # (3,)
 
-        out = mhr_lbs.mhr_query(self._mhr_model[0], shape, model_params, device=shape.device)
+        out = mhr_lbs.mhr_query(self._mhr_model[0], shape, model_params, device=str(shape.device))
         joint_pos = out['joint_pos']  # (1,127,3)
         joint_rotmat = out['joint_rotmat']  # (1,127,3,3)
 
@@ -90,11 +103,11 @@ class DirectPoseOptimization(nn.Module):
         loss_pose = (model_params - self.model_params_init[idx]).square().mean()
         return updated_camera, {'pose': loss_pose}
 
-    def regularization(self, out):
+    def regularization(self, out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {}
 
 
-def get_pose_correction(cfg, metadata):
+def get_pose_correction(cfg: DictConfig, metadata: MHRMetadata) -> nn.Module:
     name = cfg.name
     model_dict = {
         "none": NoPoseCorrection,

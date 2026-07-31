@@ -1,88 +1,148 @@
+from __future__ import annotations
+
+from typing import Any, Callable, Union, cast
+
 import numpy as np
+import numpy.typing as npt
+import tinycudann as tcnn
 import torch
 import torch.nn as nn
-import tinycudann as tcnn
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
+from typing_extensions import TypeAlias
+
+ConfigPrimitive: TypeAlias = Union[
+    "dict[str, ConfigPrimitive]", "list[ConfigPrimitive]", str, int, float, bool, None
+]
+
+
+def _identity(x: torch.Tensor) -> torch.Tensor:
+    return x
+
+
+def _make_periodic_embed_fn(
+    p_fn: Callable[[torch.Tensor], torch.Tensor], freq: torch.Tensor
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return p_fn(x * freq)
+    return fn
+
+
+def _make_hannw_embed_fn(
+    p_fn: Callable[[torch.Tensor], torch.Tensor], freq: torch.Tensor, w: torch.Tensor
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return w * p_fn(x * freq)
+    return fn
 
 
 class Embedder:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
+    def __init__(
+        self,
+        include_input: bool,
+        input_dims: int,
+        max_freq_log2: float,
+        num_freqs: int,
+        log_sampling: bool,
+        periodic_fns: list[Callable[[torch.Tensor], torch.Tensor]],
+    ) -> None:
+        self.include_input = include_input
+        self.input_dims = input_dims
+        self.max_freq_log2 = max_freq_log2
+        self.num_freqs = num_freqs
+        self.log_sampling = log_sampling
+        self.periodic_fns = periodic_fns
         self.create_embedding_fn()
 
-    def create_embedding_fn(self):
-        embed_fns = []
-        d = self.kwargs['input_dims']
+    def create_embedding_fn(self) -> None:
+        embed_fns: list[Callable[[torch.Tensor], torch.Tensor]] = []
+        d = self.input_dims
         out_dim = 0
-        if self.kwargs['include_input']:
-            embed_fns.append(lambda x: x)
+        if self.include_input:
+            embed_fns.append(_identity)
             out_dim += d
 
-        max_freq = self.kwargs['max_freq_log2']
-        N_freqs = self.kwargs['num_freqs']
+        max_freq = self.max_freq_log2
+        N_freqs = self.num_freqs
 
-        if self.kwargs['log_sampling']:
+        freq_bands: torch.Tensor
+        if self.log_sampling:
             freq_bands = 2. ** torch.linspace(0., max_freq, N_freqs)
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, N_freqs)
 
         for freq in freq_bands:
-            for p_fn in self.kwargs['periodic_fns']:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+            for p_fn in self.periodic_fns:
+                embed_fns.append(_make_periodic_embed_fn(p_fn, freq))
                 out_dim += d
 
         self.embed_fns = embed_fns
         self.out_dim = out_dim
 
-    def embed(self, inputs):
+    def embed(self, inputs: torch.Tensor) -> torch.Tensor:
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
 
-def get_embedder(multires, input_dims=3):
+def get_embedder(multires: int, input_dims: int = 3) -> tuple[Callable[[torch.Tensor], torch.Tensor], int]:
     if multires == 0:
-        return lambda x: x, input_dims
+        return (lambda x: x), input_dims
     assert multires > 0
 
-    embed_kwargs = {
-        'include_input': True,
-        'input_dims': input_dims,
-        'max_freq_log2': multires-1,
-        'num_freqs': multires,
-        'log_sampling': True,
-        'periodic_fns': [torch.sin, torch.cos],
-    }
+    embedder_obj = Embedder(
+        include_input=True,
+        input_dims=input_dims,
+        max_freq_log2=multires - 1,
+        num_freqs=multires,
+        log_sampling=True,
+        periodic_fns=[torch.sin, torch.cos],
+    )
 
-    embedder_obj = Embedder(**embed_kwargs)
-    def embed(x, eo=embedder_obj): return eo.embed(x)
+    def embed(x: torch.Tensor, eo: Embedder = embedder_obj) -> torch.Tensor:
+        return eo.embed(x)
+
     return embed, embedder_obj.out_dim
 
 
 class HannwEmbedder:
-    def __init__(self, cfg, **kwargs):
+    def __init__(
+        self,
+        cfg: DictConfig,
+        include_input: bool,
+        input_dims: int,
+        max_freq_log2: float,
+        num_freqs: int,
+        periodic_fns: list[Callable[[torch.Tensor], torch.Tensor]],
+        iter_val: int,
+    ) -> None:
         self.cfg = cfg
-        self.kwargs = kwargs
+        self.include_input = include_input
+        self.input_dims = input_dims
+        self.max_freq_log2 = max_freq_log2
+        self.num_freqs = num_freqs
+        self.periodic_fns = periodic_fns
+        self.iter_val = iter_val
         self.create_embedding_fn()
 
-    def create_embedding_fn(self):
-        embed_fns = []
-        d = self.kwargs['input_dims']
+    def create_embedding_fn(self) -> None:
+        embed_fns: list[Callable[[torch.Tensor], torch.Tensor]] = []
+        d = self.input_dims
         out_dim = 0
-        if self.kwargs['include_input']:
-            embed_fns.append(lambda x: x)
+        if self.include_input:
+            embed_fns.append(_identity)
             out_dim += d
 
-        max_freq = self.kwargs['max_freq_log2']
-        N_freqs = self.kwargs['num_freqs']
+        max_freq = self.max_freq_log2
+        N_freqs = self.num_freqs
 
         freq_bands = 2. ** torch.linspace(0., max_freq, steps=N_freqs)
 
         # get hann window weights
+        alpha: torch.Tensor
         if self.cfg.full_band_iter <= 0 or self.cfg.kick_in_iter >= self.cfg.full_band_iter:
             alpha = torch.tensor(N_freqs, dtype=torch.float32)
         else:
             kick_in_iter = torch.tensor(self.cfg.kick_in_iter,
                                         dtype=torch.float32)
-            t = torch.clamp(self.kwargs['iter_val'] - kick_in_iter, min=0.)
+            t = torch.clamp(self.iter_val - kick_in_iter, min=0.)
             N = self.cfg.full_band_iter - kick_in_iter
             m = N_freqs
             alpha = m * t / N
@@ -91,39 +151,47 @@ class HannwEmbedder:
             w = (1. - torch.cos(np.pi * torch.clamp(alpha - freq_idx,
                                                     min=0., max=1.))) / 2.
             # print("freq_idx: ", freq_idx, "weight: ", w, "iteration: ", self.kwargs['iter_val'])
-            for p_fn in self.kwargs['periodic_fns']:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq, w=w: w * p_fn(x * freq))
+            for p_fn in self.periodic_fns:
+                embed_fns.append(_make_hannw_embed_fn(p_fn, freq, w))
                 out_dim += d
 
         self.embed_fns = embed_fns
         self.out_dim = out_dim
 
-    def embed(self, inputs):
+    def embed(self, inputs: torch.Tensor) -> torch.Tensor:
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
 
-def get_hannw_embedder(cfg, multires, iter_val,):
-    embed_kwargs = {
-        'include_input': False,
-        'input_dims': 3,
-        'max_freq_log2': multires - 1,
-        'num_freqs': multires,
-        'periodic_fns': [torch.sin, torch.cos],
-        'iter_val': iter_val
-    }
+def get_hannw_embedder(
+    cfg: DictConfig, multires: int, iter_val: int
+) -> tuple[Callable[[torch.Tensor], torch.Tensor], int]:
+    embedder_obj = HannwEmbedder(
+        cfg,
+        include_input=False,
+        input_dims=3,
+        max_freq_log2=multires - 1,
+        num_freqs=multires,
+        periodic_fns=[torch.sin, torch.cos],
+        iter_val=iter_val,
+    )
 
-    embedder_obj = HannwEmbedder(cfg, **embed_kwargs)
-    embed = lambda x, eo=embedder_obj: eo.embed(x)
+    def embed(x: torch.Tensor, eo: HannwEmbedder = embedder_obj) -> torch.Tensor:
+        return eo.embed(x)
+
     return embed, embedder_obj.out_dim
 
 class HierarchicalPoseEncoder(nn.Module):
     '''Hierarchical encoder from LEAP.'''
 
-    def __init__(self, num_joints, rel_joints=False, dim_per_joint=6, out_dim=-1, ktree_parents=None, **kwargs):
+    def __init__(
+        self,
+        num_joints: int,
+        ktree_parents: npt.NDArray[np.integer[Any]],
+        rel_joints: bool = False,
+        dim_per_joint: int = 6,
+        out_dim: int = -1,
+    ) -> None:
         super().__init__()
-
-        if ktree_parents is None:
-            raise ValueError("HierarchicalPoseEncoder requires ktree_parents (e.g. metadata['joint_parents'])")
 
         self.num_joints = num_joints
         self.rel_joints = rel_joints
@@ -141,13 +209,15 @@ class HierarchicalPoseEncoder(nn.Module):
         self.layers = nn.ModuleList(layers)
 
         if out_dim <= 0:
-            self.out_layer = nn.Identity()
+            self.out_layer: nn.Module = nn.Identity()
             self.n_output_dims = num_joints * dim_per_joint
         else:
             self.out_layer = nn.Linear(num_joints * dim_per_joint, out_dim)
             self.n_output_dims = out_dim
 
-    def forward(self, rots, Jtrs, skinning_weight=None):
+    def forward(
+        self, rots: torch.Tensor, Jtrs: torch.Tensor, skinning_weight: torch.Tensor | None = None
+    ) -> torch.Tensor:
         batch_size = rots.size(0)
 
         if self.rel_joints:
@@ -159,7 +229,7 @@ class HierarchicalPoseEncoder(nn.Module):
         global_feat = torch.cat([rots.view(batch_size, -1), Jtrs.view(batch_size, -1)], dim=-1)
         global_feat = self.layer_0(global_feat)
         # global_feat = (self.layer_0.weight@global_feat[0]+self.layer_0.bias)[None]
-        out = [None] * self.num_joints
+        joint_feats: list[torch.Tensor] = [torch.empty(0)] * self.num_joints
         for j_idx in range(self.num_joints):
             rot = rots[:, j_idx, :]
             Jtr = Jtrs[:, j_idx, :]
@@ -167,19 +237,19 @@ class HierarchicalPoseEncoder(nn.Module):
             if parent == -1:
                 bone_l = torch.norm(Jtr, dim=-1, keepdim=True)
                 in_feat = torch.cat([rot, Jtr, bone_l, global_feat], dim=-1)
-                out[j_idx] = self.layers[j_idx](in_feat)
+                joint_feats[j_idx] = self.layers[j_idx](in_feat)
             else:
-                parent_feat = out[parent]
+                parent_feat = joint_feats[parent]
                 bone_l = torch.norm(Jtr if self.rel_joints else Jtr - Jtrs[:, parent, :], dim=-1, keepdim=True)
                 in_feat = torch.cat([rot, Jtr, bone_l, parent_feat], dim=-1)
-                out[j_idx] = self.layers[j_idx](in_feat)
+                joint_feats[j_idx] = self.layers[j_idx](in_feat)
 
-        out = torch.cat(out, dim=-1)
-        out = self.out_layer(out)
-        return out
+        out = torch.cat(joint_feats, dim=-1)
+        out_final: torch.Tensor = self.out_layer(out)
+        return out_final
 
 class VanillaCondMLP(nn.Module):
-    def __init__(self, dim_in, dim_cond, dim_out, config, dim_coord=3):
+    def __init__(self, dim_in: int, dim_cond: int, dim_out: int, config: DictConfig, dim_coord: int = 3) -> None:
         super(VanillaCondMLP, self).__init__()
 
         self.n_input_dims = dim_in
@@ -190,7 +260,7 @@ class VanillaCondMLP(nn.Module):
         self.config = config
         dims = [dim_in] + [self.n_neurons for _ in range(self.n_hidden_layers)] + [dim_out]
 
-        self.embed_fn = None
+        self.embed_fn: Callable[[torch.Tensor], torch.Tensor] | None = None
         if config.multires > 0:
             embed_fn, input_ch = get_embedder(config.multires, input_dims=dim_in)
             self.embed_fn = embed_fn
@@ -220,20 +290,22 @@ class VanillaCondMLP(nn.Module):
 
         self.activation = nn.LeakyReLU()
 
-    def forward(self, coords, cond=None):
+    def forward(self, coords: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
         if cond is not None:
             cond = cond.expand(coords.shape[0], -1)
 
+        coords_embedded: torch.Tensor
         if self.embed_fn is not None:
             coords_embedded = self.embed_fn(coords)
         else:
             coords_embedded = coords
 
-        x = coords_embedded
+        x: torch.Tensor = coords_embedded
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
 
             if l in self.config.cond_in:
+                assert cond is not None
                 x = torch.cat([x, cond], 1)
 
             if l in self.config.skip_in:
@@ -246,7 +318,7 @@ class VanillaCondMLP(nn.Module):
 
         return x
 
-def get_skinning_mlp(n_input_dims, n_output_dims, config):
+def get_skinning_mlp(n_input_dims: int, n_output_dims: int, config: DictConfig) -> VanillaCondMLP:
     if config.otype == 'VanillaMLP':
         network = VanillaCondMLP(n_input_dims, 0, n_output_dims, config)
     else:
@@ -256,7 +328,7 @@ def get_skinning_mlp(n_input_dims, n_output_dims, config):
 
 
 class HannwCondMLP(nn.Module):
-    def __init__(self, dim_in, dim_cond, dim_out, config, dim_coord=3):
+    def __init__(self, dim_in: int, dim_cond: int, dim_out: int, config: DictConfig, dim_coord: int = 3) -> None:
         super(HannwCondMLP, self).__init__()
 
         self.n_input_dims = dim_in
@@ -294,21 +366,23 @@ class HannwCondMLP(nn.Module):
 
         self.activation = nn.ReLU()
 
-    def forward(self, coords, iteration, cond=None):
+    def forward(self, coords: torch.Tensor, iteration: int, cond: torch.Tensor | None = None) -> torch.Tensor:
         if cond is not None:
             cond = cond.expand(coords.shape[0], -1)
 
+        coords_embedded: torch.Tensor
         if self.config.multires > 0:
             embed_fn, _ = get_hannw_embedder(self.config.embedder, self.config.multires, iteration)
             coords_embedded = embed_fn(coords)
         else:
             coords_embedded = coords
 
-        x = coords_embedded
+        x: torch.Tensor = coords_embedded
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
 
             if l in self.config.cond_in:
+                assert cond is not None
                 x = torch.cat([x, cond], 1)
 
             if l in self.config.skip_in:
@@ -321,11 +395,11 @@ class HannwCondMLP(nn.Module):
 
         return x
 
-def config_to_primitive(config, resolve=True):
-    return OmegaConf.to_container(config, resolve=resolve)
+def config_to_primitive(config: DictConfig, resolve: bool = True) -> ConfigPrimitive:
+    return cast(ConfigPrimitive, OmegaConf.to_container(config, resolve=resolve))
 
 class HashGrid(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: DictConfig) -> None:
         super().__init__()
         xL = config.get('max_resolution', -1)
         if xL > 0:
@@ -336,7 +410,8 @@ class HashGrid(nn.Module):
         self.n_output_dims = self.encoding.n_output_dims
         self.n_input_dims = self.encoding.n_input_dims
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x + 1.) * 0.5 # [-1, 1] => [0, 1]
 
-        return self.encoding(x)
+        out: torch.Tensor = self.encoding(x)
+        return out

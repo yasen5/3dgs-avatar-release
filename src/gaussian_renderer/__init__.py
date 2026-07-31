@@ -3,28 +3,48 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch
-import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from __future__ import annotations
 
-def render(data,
-           iteration,
-           scene,
-           pipe,
+import math
+from typing import TypedDict
+
+import torch
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from omegaconf import DictConfig
+
+from src.scene import Scene
+from src.scene.cameras import Camera
+from src.scene.gaussian_model import GaussianModel
+
+
+class RenderOutput(TypedDict):
+    deformed_gaussian: GaussianModel
+    render: torch.Tensor
+    viewspace_points: torch.Tensor
+    visibility_filter: torch.Tensor
+    radii: torch.Tensor
+    loss_reg: dict[str, torch.Tensor]
+    opacity_render: torch.Tensor | None
+
+
+def render(data: Camera,
+           iteration: int,
+           scene: Scene,
+           pipe: DictConfig,
            bg_color : torch.Tensor,
-           scaling_modifier = 1.0,
-           override_color = None,
-           compute_loss=True,
-           return_opacity=False, ):
+           scaling_modifier: float = 1.0,
+           override_color: torch.Tensor | None = None,
+           compute_loss: bool = True,
+           return_opacity: bool = False) -> RenderOutput:
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
     pc, loss_reg, colors_precomp = scene.convert_gaussians(data, iteration, compute_loss)
@@ -33,7 +53,7 @@ def render(data,
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
-    except:
+    except Exception:
         pass
 
     # Set up rasterization configuration
@@ -76,7 +96,7 @@ def render(data,
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -87,7 +107,7 @@ def render(data,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
 
-    opacity_image = None
+    opacity_image: torch.Tensor | None = None
     if return_opacity:
         opacity_image, _ = rasterizer(
             means3D=means3D,

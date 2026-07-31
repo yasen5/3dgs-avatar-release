@@ -3,31 +3,34 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch
+from __future__ import annotations
+
 import os
-import sys
-from datetime import datetime
-import numpy as np
 import random
+from typing import Callable
 
-import torch.nn as nn
-import lpips
 import cv2
+import lpips
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL.Image import Image as PILImage
 from skimage.metrics import structural_similarity as compute_ssim
-
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-def inverse_sigmoid(x):
-    return torch.log(x/(1-x))
 
-def PILtoTorch(pil_image, resolution):
+def inverse_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    return torch.log(x / (1 - x))
+
+
+def PILtoTorch(pil_image: PILImage, resolution: tuple[int, int]) -> torch.Tensor:
     resized_image_PIL = pil_image.resize(resolution)
     resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
     if len(resized_image.shape) == 3:
@@ -35,9 +38,14 @@ def PILtoTorch(pil_image, resolution):
     else:
         return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
 
+
 def get_expon_lr_func(
-    lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
-):
+    lr_init: float,
+    lr_final: float,
+    lr_delay_steps: int = 0,
+    lr_delay_mult: float = 1.0,
+    max_steps: int = 1000000,
+) -> Callable[[int], float]:
     """
     Copied from Plenoxels
 
@@ -53,7 +61,7 @@ def get_expon_lr_func(
     :return HoF which takes step as input
     """
 
-    def helper(step):
+    def helper(step: int) -> float:
         if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
             # Disable this parameter
             return 0.0
@@ -66,11 +74,12 @@ def get_expon_lr_func(
             delay_rate = 1.0
         t = np.clip(step / max_steps, 0, 1)
         log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
-        return delay_rate * log_lerp
+        return float(delay_rate * log_lerp)
 
     return helper
 
-def strip_lowerdiag(L):
+
+def strip_lowerdiag(L: torch.Tensor) -> torch.Tensor:
     uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
 
     uncertainty[:, 0] = L[:, 0, 0]
@@ -81,11 +90,13 @@ def strip_lowerdiag(L):
     uncertainty[:, 5] = L[:, 2, 2]
     return uncertainty
 
-def strip_symmetric(sym):
+
+def strip_symmetric(sym: torch.Tensor) -> torch.Tensor:
     return strip_lowerdiag(sym)
 
-def build_rotation(r):
-    norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
+
+def build_rotation(r: torch.Tensor) -> torch.Tensor:
+    norm = torch.sqrt(r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3])
 
     q = r / norm[:, None]
 
@@ -96,16 +107,17 @@ def build_rotation(r):
     y = q[:, 2]
     z = q[:, 3]
 
-    R[:, 0, 0] = 1 - 2 * (y*y + z*z)
-    R[:, 0, 1] = 2 * (x*y - r*z)
-    R[:, 0, 2] = 2 * (x*z + r*y)
-    R[:, 1, 0] = 2 * (x*y + r*z)
-    R[:, 1, 1] = 1 - 2 * (x*x + z*z)
-    R[:, 1, 2] = 2 * (y*z - r*x)
-    R[:, 2, 0] = 2 * (x*z - r*y)
-    R[:, 2, 1] = 2 * (y*z + r*x)
-    R[:, 2, 2] = 1 - 2 * (x*x + y*y)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - r * z)
+    R[:, 0, 2] = 2 * (x * z + r * y)
+    R[:, 1, 0] = 2 * (x * y + r * z)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - r * x)
+    R[:, 2, 0] = 2 * (x * z - r * y)
+    R[:, 2, 1] = 2 * (y * z + r * x)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
     return R
+
 
 def rotation_matrix_to_quaternion(rotation_matrix: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
     r"""Convert 3x3 rotation matrix to 4d quaternion vector.
@@ -181,7 +193,7 @@ def rotation_matrix_to_quaternion(rotation_matrix: torch.Tensor, eps: float = 1.
     return quaternion
 
 
-def quaternion_multiply(r, s):
+def quaternion_multiply(r: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     r0, r1, r2, r3 = r.unbind(-1)
     s0, s1, s2, s3 = s.unbind(-1)
     t0 = r0 * s0 - r1 * s1 - r2 * s2 - r3 * s3
@@ -191,7 +203,8 @@ def quaternion_multiply(r, s):
     t = torch.stack([t0, t1, t2, t3], dim=-1)
     return t
 
-def build_scaling_rotation(s, r):
+
+def build_scaling_rotation(s: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
     L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
     if r.shape[-1] == 4:
         # quaternion to matrix
@@ -199,14 +212,15 @@ def build_scaling_rotation(s, r):
     else:
         R = r
 
-    L[:,0,0] = s[:,0]
-    L[:,1,1] = s[:,1]
-    L[:,2,2] = s[:,2]
+    L[:, 0, 0] = s[:, 0]
+    L[:, 1, 1] = s[:, 1]
+    L[:, 2, 2] = s[:, 2]
 
     L = R @ L
     return L
 
-def fix_random(seed):
+
+def fix_random(seed: int) -> None:
     if seed >= 0:
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
         random.seed(seed)
@@ -217,69 +231,92 @@ def fix_random(seed):
         torch.backends.cudnn.deterministic = True
         torch.use_deterministic_algorithms(True)
 
+
+class EvaluationMetrics(dict[str, torch.Tensor]):
+    """Mapping with fixed 'psnr'/'ssim'/'lpips' keys, as produced by the evaluator modules below."""
+
+
 # evaluation metrics
 class Evaluator(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.psnr = PSNR()
         self.ssim = SSIM()
         self.lpips = LPIPS()
 
-    def forward(self, inputs, targets):
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> EvaluationMetrics:
         psnr = self.psnr(inputs, targets)
         ssim = self.ssim(inputs, targets)
         lpips_ = self.lpips(inputs, targets)
-        return {
+        return EvaluationMetrics({
             "psnr": psnr,
             "ssim": ssim,
             "lpips": lpips_,
-        }
+        })
+
 
 class PSNR(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, inputs, targets, valid_mask=None, reduction='mean'):
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        reduction: str = 'mean',
+    ) -> torch.Tensor:
         assert reduction in ['mean', 'none']
         value = (inputs - targets) ** 2
         if valid_mask is not None:
             value = value[valid_mask]
         if reduction == 'mean':
             return -10 * torch.log10(torch.mean(value))
-        elif reduction == 'none':
+        else:
             return -10 * torch.log10(torch.mean(value, dim=tuple(range(value.ndim)[1:])))
 
 
 class SSIM(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, inputs, targets, valid_mask=None, reduction='mean'):
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        reduction: str = 'mean',
+    ) -> torch.Tensor:
         device = inputs.device
-        inputs = inputs.cpu().numpy()
-        targets = targets.cpu().numpy()
+        inputs_np = inputs.cpu().numpy()
+        targets_np = targets.cpu().numpy()
         if valid_mask is not None:
-            valid_mask = valid_mask.cpu().numpy()
-            x, y, w, h = cv2.boundingRect(valid_mask.astype(np.uint8))
-            img_pred = inputs[y:y + h, x:x + w]
-            img_gt = targets[y:y + h, x:x + w]
+            valid_mask_np = valid_mask.cpu().numpy()
+            x, y, w, h = cv2.boundingRect(valid_mask_np.astype(np.uint8))
+            img_pred = inputs_np[y:y + h, x:x + w]
+            img_gt = targets_np[y:y + h, x:x + w]
         else:
-            img_pred = inputs
-            img_gt = targets
+            img_pred = inputs_np
+            img_gt = targets_np
 
         # compute ssim
-        ssim = compute_ssim(img_pred, img_gt, channel_axis=0, data_range=1.0)
-        ssim = torch.tensor(ssim, device=device)
-        return ssim
+        ssim_value = compute_ssim(img_pred, img_gt, channel_axis=0, data_range=1.0)
+        return torch.tensor(ssim_value, device=device)
 
 
 class LPIPS(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.loss_fn_vgg = lpips.LPIPS(net='vgg').cuda()
         self.loss_fn_vgg.eval()
 
-    def forward(self, inputs, targets, valid_mask=None, reduction='mean'):
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        reduction: str = 'mean',
+    ) -> torch.Tensor:
         if valid_mask is not None:
             x, y, w, h = cv2.boundingRect(valid_mask.cpu().numpy().astype(np.uint8))
             img_pred = inputs[:, y:y + h, x:x + w]
@@ -288,11 +325,12 @@ class LPIPS(nn.Module):
             img_pred = inputs
             img_gt = targets
 
-        score = self.loss_fn_vgg(img_pred, img_gt, normalize=True)
+        score: torch.Tensor = self.loss_fn_vgg(img_pred, img_gt, normalize=True)
         return score.flatten()
 
+
 class PSEvaluator(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.lpips = LearnedPerceptualImagePatchSimilarity(net_type="alex")
         self.psnr = PeakSignalNoiseRatio(data_range=1)
@@ -300,13 +338,13 @@ class PSEvaluator(nn.Module):
         self.cuda()
         self.eval()
 
-    def forward(self, rgb, rgb_gt):
+    def forward(self, rgb: torch.Tensor, rgb_gt: torch.Tensor) -> EvaluationMetrics:
         # torchmetrics assumes NCHW format
         rgb = rgb.unsqueeze(0)
         rgb_gt = rgb_gt.unsqueeze(0)
 
-        return {
+        return EvaluationMetrics({
             "psnr": self.psnr(rgb, rgb_gt),
             "ssim": self.ssim(rgb, rgb_gt),
             "lpips": self.lpips(rgb, rgb_gt),
-        }
+        })

@@ -3,23 +3,29 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch
+from __future__ import annotations
+
 import math
+from typing import Any, NamedTuple
+
 import numpy as np
-from typing import NamedTuple
+import numpy.typing as npt
+import torch
+
 
 class BasicPointCloud(NamedTuple):
-    points : np.array
-    colors : np.array
-    normals : np.array
+    points: npt.NDArray[np.floating[Any]]
+    colors: npt.NDArray[np.floating[Any]]
+    normals: npt.NDArray[np.floating[Any]]
 
-def geom_transform_points(points, transf_matrix):
+
+def geom_transform_points(points: torch.Tensor, transf_matrix: torch.Tensor) -> torch.Tensor:
     P, _ = points.shape
     ones = torch.ones(P, 1, dtype=points.dtype, device=points.device)
     points_hom = torch.cat([points, ones], dim=1)
@@ -28,14 +34,21 @@ def geom_transform_points(points, transf_matrix):
     denom = points_out[..., 3:] + 0.0000001
     return (points_out[..., :3] / denom).squeeze(dim=0)
 
-def getWorld2View(R, t):
+
+def getWorld2View(R: npt.NDArray[np.floating[Any]], t: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.float32]:
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = R.transpose()
     Rt[:3, 3] = t
     Rt[3, 3] = 1.0
-    return np.float32(Rt)
+    return Rt.astype(np.float32)
 
-def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
+
+def getWorld2View2(
+    R: npt.NDArray[np.floating[Any]],
+    t: npt.NDArray[np.floating[Any]],
+    translate: npt.NDArray[np.floating[Any]] = np.array([.0, .0, .0]),
+    scale: float = 1.0,
+) -> npt.NDArray[np.float32]:
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = R.transpose()
     Rt[:3, 3] = t
@@ -46,9 +59,10 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     cam_center = (cam_center + translate) * scale
     C2W[:3, 3] = cam_center
     Rt = np.linalg.inv(C2W)
-    return np.float32(Rt)
+    return Rt.astype(np.float32)
 
-def getProjectionMatrix(znear, zfar, fovX, fovY):
+
+def getProjectionMatrix(znear: float, zfar: float, fovX: float, fovY: float) -> torch.Tensor:
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
 
@@ -70,8 +84,10 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     P[2, 3] = -(zfar * znear) / (zfar - znear)
     return P
 
-def fov2focal(fov, pixels):
+
+def fov2focal(fov: float, pixels: float) -> float:
     return pixels / (2 * math.tan(fov / 2))
 
-def focal2fov(focal, pixels):
-    return 2*math.atan(pixels/(2*focal))
+
+def focal2fov(focal: float, pixels: float) -> float:
+    return 2 * math.atan(pixels / (2 * focal))

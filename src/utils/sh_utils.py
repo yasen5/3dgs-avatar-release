@@ -21,8 +21,13 @@
 #  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 #  POSSIBILITY OF SUCH DAMAGE.
 
-import torch
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
+import numpy.typing as npt
+import torch
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -55,7 +60,7 @@ C4 = [
 ]   
 
 
-def eval_sh(deg, sh, dirs):
+def eval_sh(deg: int, sh: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
     """
     Evaluate spherical harmonics at unit directions
     using hardcoded SH polynomials.
@@ -112,7 +117,7 @@ def eval_sh(deg, sh, dirs):
                             C4[8] * (xx * (xx - 3 * yy) - yy * (3 * xx - yy)) * sh[..., 24])
     return result
 
-def eval_sh_bases(deg, dirs):
+def eval_sh_bases(deg: int, dirs: torch.Tensor) -> torch.Tensor:
     """
     Evaluate spherical harmonics bases at unit directions,
     without taking linear combination.
@@ -160,13 +165,13 @@ def eval_sh_bases(deg, dirs):
                     result[..., 24] = C4[8] * (xx * (xx - 3 * yy) - yy * (3 * xx - yy));
     return result
 
-def RGB2SH(rgb):
+def RGB2SH(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb - 0.5) / C0
 
-def SH2RGB(sh):
+def SH2RGB(sh: torch.Tensor) -> torch.Tensor:
     return sh * C0 + 0.5
 
-def augm_rots(roll_range=90, pitch_range=90, yaw_range=90):
+def augm_rots(roll_range: float = 90, pitch_range: float = 90, yaw_range: float = 90) -> npt.NDArray[np.floating[Any]]:
     """ Get augmentation for rotation matrices.
     Args:
         roll_range (int): roll angle sampling range (train mode) or value (test mode)
@@ -177,38 +182,38 @@ def augm_rots(roll_range=90, pitch_range=90, yaw_range=90):
     """
     # The rotation is a number in the area [-2*rotFactor, 2*rotFactor]
     # Roll
-    rot_x = min(2*roll_range,
+    roll_angle = min(2*roll_range,
             max(-2*roll_range, np.random.randn()*roll_range))
 
-    sn, cs = np.sin(np.pi / 180 * rot_x), np.cos(np.pi / 180 * rot_x)
+    sn, cs = np.sin(np.pi / 180 * roll_angle), np.cos(np.pi / 180 * roll_angle)
     rot_x = np.eye(3)
     rot_x[1, 1] = cs
     rot_x[1, 2] = -sn
     rot_x[2, 1] = sn
     rot_x[2, 2] = cs
 
-    rot_y = min(2*pitch_range,
+    pitch_angle = min(2*pitch_range,
             max(-2*pitch_range, np.random.rand()*pitch_range))
 
     # Pitch
-    sn, cs = np.sin(np.pi / 180 * rot_y), np.cos(np.pi / 180 * rot_y)
+    sn, cs = np.sin(np.pi / 180 * pitch_angle), np.cos(np.pi / 180 * pitch_angle)
     rot_y = np.eye(3)
     rot_y[0, 0] = cs
     rot_y[0, 2] = sn
     rot_y[2, 0] = -sn
     rot_y[2, 2] = cs
 
-    rot_z = min(2*yaw_range,
+    yaw_angle = min(2*yaw_range,
             max(-2*yaw_range, np.random.randn()*yaw_range))
 
     # Yaw
-    sn, cs = np.sin(np.pi / 180 * rot_z), np.cos(np.pi / 180 * rot_z)
+    sn, cs = np.sin(np.pi / 180 * yaw_angle), np.cos(np.pi / 180 * yaw_angle)
     rot_z = np.eye(3)
     rot_z[0, 0] = cs
     rot_z[0, 1] = -sn
     rot_z[1, 0] = sn
     rot_z[1, 1] = cs
 
-    rot_mat = np.dot(rot_x, np.dot(rot_y, rot_z))
+    rot_mat: npt.NDArray[np.floating[Any]] = np.dot(rot_x, np.dot(rot_y, rot_z))
 
     return rot_mat

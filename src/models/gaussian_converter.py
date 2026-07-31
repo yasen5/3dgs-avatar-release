@@ -1,12 +1,21 @@
+from __future__ import annotations
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
+from omegaconf import DictConfig
+
+from src.dataset.mhr_native import MHRMetadata
+from src.scene.cameras import Camera
+from src.scene.gaussian_model import GaussianModel
+
 from .deformer import get_deformer
 from .pose_correction import get_pose_correction
 from .texture import get_texture
 
+
 class GaussianConverter(nn.Module):
-    def __init__(self, cfg, metadata):
+    def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
         super().__init__()
         self.cfg = cfg
         self.metadata = metadata
@@ -15,10 +24,9 @@ class GaussianConverter(nn.Module):
         self.deformer = get_deformer(cfg.model.deformer, metadata)
         self.texture = get_texture(cfg.model.texture, metadata)
 
-        self.optimizer, self.scheduler = None, None
         self.set_optimizer()
 
-    def set_optimizer(self):
+    def set_optimizer(self) -> None:
         opt_params = [
             {'params': self.deformer.rigid.parameters(), 'lr': self.cfg.opt.get('rigid_lr', 0.)},
             # {'params': self.deformer.non_rigid.parameters(), 'lr': self.cfg.opt.get('non_rigid_lr', 0.)},
@@ -37,8 +45,10 @@ class GaussianConverter(nn.Module):
         gamma = self.cfg.opt.lr_ratio ** (1. / self.cfg.opt.iterations)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
 
-    def forward(self, gaussians, camera, iteration, compute_loss=True):
-        loss_reg = {}
+    def forward(
+        self, gaussians: GaussianModel, camera: Camera, iteration: int, compute_loss: bool = True
+    ) -> tuple[GaussianModel, dict[str, torch.Tensor], torch.Tensor]:
+        loss_reg: dict[str, torch.Tensor] = {}
         # loss_reg.update(gaussians.get_opacity_loss())
         camera, loss_reg_pose = self.pose_correction(camera, iteration)
 
@@ -57,7 +67,7 @@ class GaussianConverter(nn.Module):
 
         return deformed_gaussians, loss_reg, color_precompute
 
-    def optimize(self):
+    def optimize(self) -> None:
         grad_clip = self.cfg.opt.get('grad_clip', 0.)
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)

@@ -3,55 +3,55 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
+from random import randint
+from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import cv2
+import hydra
+import lpips
 import numpy as np
 import torch
 import torch.nn.functional as F
-from random import randint
-from src.utils.loss_utils import l1_loss, ssim
-from src.gaussian_renderer import render
-from src.scene import Scene, GaussianModel
-from src.utils.general_utils import fix_random, PSEvaluator
-from tqdm import tqdm
-from src.utils.loss_utils import full_aiap_loss
-
-import hydra
-from omegaconf import OmegaConf
 import wandb
-import lpips
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from tqdm import tqdm
+
+from src.gaussian_renderer import render
+from src.scene import GaussianModel, Scene
+from src.utils.general_utils import PSEvaluator
+from src.utils.general_utils import fix_random
+from src.utils.loss_utils import full_aiap_loss, l1_loss, ssim
 
 
-def C(iteration, value):
+def retrieve_scheduled_value(iteration: int, value: float | int | ListConfig) -> float:
     if isinstance(value, int) or isinstance(value, float):
-        pass
-    else:
-        value = OmegaConf.to_container(value)
-        if not isinstance(value, list):
-            raise TypeError('Scalar specification only supports list, got', type(value))
-        value_list = [0] + value
-        i = 0
-        current_step = iteration
-        while i < len(value_list):
-            if current_step >= value_list[i]:
-                i += 2
-            else:
-                break
-        value = value_list[i - 1]
-    return value
+        return float(value)
+    container = OmegaConf.to_container(value)
+    if not isinstance(container, list):
+        raise TypeError('Scalar specification only supports list, got', type(container))
+    value_list = [0] + container
+    i = 0
+    current_step = iteration
+    while i < len(value_list):
+        if current_step >= value_list[i]:
+            i += 2
+        else:
+            break
+    return float(value_list[i - 1])
 
-def training(config):
+def training(config: DictConfig) -> None:
     model = config.model
     dataset = config.dataset
     opt = config.opt
@@ -83,7 +83,7 @@ def training(config):
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    data_stack = None
+    data_stack: list[int] = []
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -107,7 +107,7 @@ def training(config):
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        lambda_mask = C(iteration, config.opt.lambda_mask)
+        lambda_mask = retrieve_scheduled_value(iteration, config.opt.lambda_mask)
         use_mask = lambda_mask > 0.
         render_pkg = render(data, iteration, scene, pipe, background, compute_loss=True, return_opacity=use_mask)
 
@@ -117,8 +117,8 @@ def training(config):
         # Loss
         gt_image = data.original_image.cuda()
 
-        lambda_l1 = C(iteration, config.opt.lambda_l1)
-        lambda_dssim = C(iteration, config.opt.lambda_dssim)
+        lambda_l1 = retrieve_scheduled_value(iteration, config.opt.lambda_l1)
+        lambda_dssim = retrieve_scheduled_value(iteration, config.opt.lambda_dssim)
         loss_l1 = torch.tensor(0.).cuda()
         loss_dssim = torch.tensor(0.).cuda()
         if lambda_l1 > 0.:
@@ -128,13 +128,13 @@ def training(config):
         loss = lambda_l1 * loss_l1 + lambda_dssim * loss_dssim
 
         # perceptual loss
-        lambda_perceptual = C(iteration, config.opt.get('lambda_perceptual', 0.))
+        lambda_perceptual = retrieve_scheduled_value(iteration, config.opt.get('lambda_perceptual', 0.))
         if lambda_perceptual > 0:
             # crop the foreground
             mask = data.original_mask.cpu().numpy()
-            mask = np.where(mask)
-            y1, y2 = mask[1].min(), mask[1].max() + 1
-            x1, x2 = mask[2].min(), mask[2].max() + 1
+            mask_idx = np.where(mask)
+            y1, y2 = mask_idx[1].min(), mask_idx[1].max() + 1
+            x1, x2 = mask_idx[2].min(), mask_idx[2].max() + 1
             fg_image = image[:, y1:y2, x1:x2]
             gt_fg_image = gt_image[:, y1:y2, x1:x2]
 
@@ -148,26 +148,29 @@ def training(config):
         if not use_mask:
             loss_mask = torch.tensor(0.).cuda()
         elif config.opt.mask_loss_type == 'bce':
+            assert opacity is not None
             opacity = torch.clamp(opacity, 1.e-3, 1.-1.e-3)
             loss_mask = F.binary_cross_entropy(opacity, gt_mask)
         elif config.opt.mask_loss_type == 'l1':
+            assert opacity is not None
             loss_mask = F.l1_loss(opacity, gt_mask)
         else:
             raise ValueError
         loss += lambda_mask * loss_mask
 
         # skinning loss
-        lambda_skinning = C(iteration, config.opt.lambda_skinning)
+        lambda_skinning = retrieve_scheduled_value(iteration, config.opt.lambda_skinning)
         if lambda_skinning > 0:
             loss_skinning = scene.get_skinning_loss()
             loss += lambda_skinning * loss_skinning
         else:
             loss_skinning = torch.tensor(0.).cuda()
 
-        lambda_aiap_xyz = C(iteration, config.opt.get('lambda_aiap_xyz', 0.))
-        lambda_aiap_cov = C(iteration, config.opt.get('lambda_aiap_cov', 0.))
+        lambda_aiap_xyz = retrieve_scheduled_value(iteration, config.opt.get('lambda_aiap_xyz', 0.))
+        lambda_aiap_cov = retrieve_scheduled_value(iteration, config.opt.get('lambda_aiap_cov', 0.))
         if lambda_aiap_xyz > 0. or lambda_aiap_cov > 0.:
-            loss_aiap_xyz, loss_aiap_cov = full_aiap_loss(scene.gaussians, render_pkg["deformed_gaussian"])
+            aiap = full_aiap_loss(scene.gaussians, render_pkg["deformed_gaussian"])
+            loss_aiap_xyz, loss_aiap_cov = aiap.xyz, aiap.covariance
         else:
             loss_aiap_xyz = torch.tensor(0.).cuda()
             loss_aiap_cov = torch.tensor(0.).cuda()
@@ -178,7 +181,7 @@ def training(config):
         loss_reg = render_pkg["loss_reg"]
         for name, value in loss_reg.items():
             lbd = opt.get(f"lambda_{name}", 0.)
-            lbd = C(iteration, lbd)
+            lbd = retrieve_scheduled_value(iteration, lbd)
             loss += lbd * value
         loss.backward()
 
@@ -212,7 +215,7 @@ def training(config):
                 progress_bar.close()
 
             # Log and save
-            validation(iteration, testing_iterations, testing_interval, scene, evaluator,(pipe, background))
+            validation(iteration, testing_iterations, testing_interval, scene, evaluator, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -226,7 +229,7 @@ def training(config):
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt, scene, size_threshold)
-                
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -237,41 +240,58 @@ def training(config):
             if iteration in checkpoint_iterations:
                 scene.save_checkpoint(iteration)
 
-def validation(iteration, testing_iterations, testing_interval, scene : Scene, evaluator, renderArgs):
+
+class ValidationConfig(TypedDict):
+    name: str
+    cameras: list[int]
+
+
+def validation(
+    iteration: int,
+    testing_iterations: list[int],
+    testing_interval: int,
+    scene: Scene,
+    evaluator: PSEvaluator,
+    renderArgs: tuple[DictConfig, torch.Tensor],
+) -> None:
     # Report test and samples of training set
     if testing_interval > 0:
         if not iteration % testing_interval == 0:
             return
     else:
-        if not iteration in testing_iterations:
+        if iteration not in testing_iterations:
             return
 
     scene.eval()
     torch.cuda.empty_cache()
-    validation_configs = ({'name': 'test', 'cameras' : list(range(len(scene.test_dataset)))},
-                          {'name': 'train', 'cameras' : [idx for idx in range(0, len(scene.train_dataset), len(scene.train_dataset) // 10)]})
+    validation_configs: tuple[ValidationConfig, ValidationConfig] = (
+        {'name': 'test', 'cameras': list(range(len(scene.test_dataset)))},
+        {'name': 'train', 'cameras': [idx for idx in range(0, len(scene.train_dataset), len(scene.train_dataset) // 10)]},
+    )
 
-    for config in validation_configs:
-        if config['cameras'] and len(config['cameras']) > 0:
-            l1_test = 0.0
-            psnr_test = 0.0
-            ssim_test = 0.0
-            lpips_test = 0.0
+    for val_config in validation_configs:
+        if val_config['cameras'] and len(val_config['cameras']) > 0:
+            l1_test = torch.tensor(0.0)
+            psnr_test = torch.tensor(0.0)
+            ssim_test = torch.tensor(0.0)
+            lpips_test = torch.tensor(0.0)
             examples = []
-            for idx, data_idx in enumerate(config['cameras']):
-                data = getattr(scene, config['name'] + '_dataset')[data_idx]
+            for idx, data_idx in enumerate(val_config['cameras']):
+                data = getattr(scene, val_config['name'] + '_dataset')[data_idx]
                 render_pkg = render(data, iteration, scene, *renderArgs, compute_loss=False, return_opacity=True)
                 image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 gt_image = torch.clamp(data.original_image.to("cuda"), 0.0, 1.0)
-                opacity_image = torch.clamp(render_pkg["opacity_render"], 0.0, 1.0)
+                opacity_render = render_pkg["opacity_render"]
+                assert opacity_render is not None
+                opacity_image = torch.clamp(opacity_render, 0.0, 1.0)
 
 
                 wandb_img = wandb.Image(opacity_image,
-                                        caption=config['name'] + "_view_{}/render_opacity".format(data.image_name))
+                                        caption=val_config['name'] + "_view_{}/render_opacity".format(data.image_name))
                 examples.append(wandb_img)
-                wandb_img = wandb.Image(image, caption=config['name'] + "_view_{}/render".format(data.image_name))
+                wandb_img = wandb.Image(image, caption=val_config['name'] + "_view_{}/render".format(data.image_name))
                 examples.append(wandb_img)
-                wandb_img = wandb.Image(gt_image, caption=config['name'] + "_view_{}/ground_truth".format(
+                wandb_img = wandb.Image(gt_image, caption=val_config['name'] + "_view_{}/ground_truth".format(
                     data.image_name))
                 examples.append(wandb_img)
 
@@ -281,28 +301,28 @@ def validation(iteration, testing_iterations, testing_interval, scene : Scene, e
                 ssim_test += metrics_test["ssim"]
                 lpips_test += metrics_test["lpips"]
 
-                wandb.log({config['name'] + "_images": examples})
+                wandb.log({val_config['name'] + "_images": examples})
                 examples.clear()
 
-            psnr_test /= len(config['cameras'])
-            ssim_test /= len(config['cameras'])
-            lpips_test /= len(config['cameras'])
-            l1_test /= len(config['cameras'])
-            print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+            psnr_test /= len(val_config['cameras'])
+            ssim_test /= len(val_config['cameras'])
+            lpips_test /= len(val_config['cameras'])
+            l1_test /= len(val_config['cameras'])
+            print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, val_config['name'], l1_test, psnr_test))
             wandb.log({
-                config['name'] + '/loss_viewpoint - l1_loss': l1_test,
-                config['name'] + '/loss_viewpoint - psnr': psnr_test,
-                config['name'] + '/loss_viewpoint - ssim': ssim_test,
-                config['name'] + '/loss_viewpoint - lpips': lpips_test,
+                val_config['name'] + '/loss_viewpoint - l1_loss': l1_test,
+                val_config['name'] + '/loss_viewpoint - psnr': psnr_test,
+                val_config['name'] + '/loss_viewpoint - ssim': ssim_test,
+                val_config['name'] + '/loss_viewpoint - lpips': lpips_test,
             })
 
-    wandb.log({'scene/opacity_histogram': wandb.Histogram(scene.gaussians.get_opacity.cpu())})
+    wandb.log({'scene/opacity_histogram': wandb.Histogram(scene.gaussians.get_opacity.cpu().tolist())})
     wandb.log({'total_points': scene.gaussians.get_xyz.shape[0]})
     torch.cuda.empty_cache()
     scene.train()
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
-def main(config):
+def main(config: DictConfig) -> None:
     print(OmegaConf.to_yaml(config))
     OmegaConf.set_struct(config, False) # allow adding new values to config
 
@@ -318,7 +338,7 @@ def main(config):
         project='gaussian-splatting-avatar',
         entity='fast-avatar',
         dir=config.exp_dir,
-        config=OmegaConf.to_container(config, resolve=True),
+        config=cast("dict[str, object]", OmegaConf.to_container(config, resolve=True)),
         settings=wandb.Settings(start_method='fork'),
     )
 

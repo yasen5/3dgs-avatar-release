@@ -1,36 +1,42 @@
+from __future__ import annotations
+
+import igl
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from omegaconf import DictConfig
 
-import igl
-
-from src.utils.general_utils import build_rotation
+from src.dataset.mhr_native import MHRMetadata
 from src.models.network_utils import get_skinning_mlp
+from src.scene.cameras import Camera
+from src.scene.gaussian_model import GaussianModel
+from src.utils.general_utils import build_rotation
+
 
 class RigidDeform(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg: DictConfig) -> None:
         super().__init__()
         self.cfg = cfg
 
-    def forward(self, gaussians, iteration, camera):
+    def forward(self, gaussians: GaussianModel, iteration: int, camera: Camera) -> GaussianModel:
         raise NotImplementedError
 
-    def regularization(self):
-        return NotImplementedError
+    def regularization(self) -> dict[str, torch.Tensor]:
+        raise NotImplementedError
 
 class Identity(RigidDeform):
     """ Identity mapping for single frame reconstruction """
-    def __init__(self, cfg, metadata):
+    def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
         super().__init__(cfg)
 
-    def forward(self, gaussians, iteration, camera):
+    def forward(self, gaussians: GaussianModel, iteration: int, camera: Camera) -> GaussianModel:
         return gaussians
 
-    def regularization(self):
+    def regularization(self) -> dict[str, torch.Tensor]:
         return {}
 
-def create_voxel_grid(d, h, w, device='cpu'):
+def create_voxel_grid(d: int, h: int, w: int, device: str = 'cpu') -> torch.Tensor:
     x_range = (torch.linspace(-1,1,steps=w,device=device)).view(1, 1, 1, w).expand(1, d, h, w)  # [1, H, W, D]
     y_range = (torch.linspace(-1,1,steps=h,device=device)).view(1, 1, h, 1).expand(1, d, h, w)  # [1, H, W, D]
     z_range = (torch.linspace(-1,1,steps=d,device=device)).view(1, d, 1, 1).expand(1, d, h, w)  # [1, H, W, D]
@@ -39,7 +45,7 @@ def create_voxel_grid(d, h, w, device='cpu'):
     return grid
 
 class SkinningField(RigidDeform):
-    def __init__(self, cfg, metadata):
+    def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
         super().__init__(cfg)
         self.cano_verts = metadata["cano_verts"]
         self.skinning_weights = metadata["skinning_weights"]
@@ -47,17 +53,19 @@ class SkinningField(RigidDeform):
         self.faces = metadata["faces"]
         self.cano_mesh = metadata["cano_mesh"]
 
-        self.distill = cfg.distill
+        self.distill: bool = cfg.distill
         d, h, w = cfg.res // cfg.z_ratio, cfg.res, cfg.res
         self.resolution = (d, h, w)
         self.n_joints = cfg.d_out
+        self.grid: torch.Tensor
         if self.distill:
             self.grid = create_voxel_grid(d, h, w).cuda()
 
         self.lbs_network = get_skinning_mlp(3, cfg.d_out, cfg.skinning_network)
+        self.lbs_voxel_final: torch.Tensor
 
 
-    def precompute(self, recompute_skinning=True):
+    def precompute(self, recompute_skinning: bool = True) -> None:
         if recompute_skinning or not hasattr(self, "lbs_voxel_final"):
             d, h, w = self.resolution
 
@@ -68,7 +76,7 @@ class SkinningField(RigidDeform):
 
             self.lbs_voxel_final = lbs_voxel_final.permute(1, 0).reshape(1, self.n_joints, d, h, w)
 
-    def get_forward_transform(self, xyz, tfs):
+    def get_forward_transform(self, xyz: torch.Tensor, tfs: torch.Tensor) -> torch.Tensor:
         if self.distill:
             self.precompute(recompute_skinning=self.training)
             fwd_grid = torch.einsum("bcdhw,bcxy->bxydhw", self.lbs_voxel_final, tfs[None])
@@ -81,7 +89,7 @@ class SkinningField(RigidDeform):
             T_fwd = torch.matmul(pts_W, tfs.view(-1, 16)).view(-1, 4, 4).float()
         return T_fwd
 
-    def sample_skinning_loss(self):
+    def sample_skinning_loss(self) -> tuple[torch.Tensor, torch.Tensor]:
         points_skinning, face_idx = self.cano_mesh.sample(self.cfg.n_reg_pts, return_index=True)
         points_skinning = points_skinning.view(np.ndarray).astype(np.float32)
         bary_coords = igl.barycentric_coordinates_tri(
@@ -93,14 +101,14 @@ class SkinningField(RigidDeform):
         vert_ids = self.faces[face_idx, ...]
         pts_W = (self.skinning_weights[vert_ids] * bary_coords[..., None]).sum(axis=1)
 
-        points_skinning = torch.from_numpy(points_skinning).cuda()
-        pts_W = torch.from_numpy(pts_W).cuda()
-        return points_skinning, pts_W
+        points_skinning_t = torch.from_numpy(points_skinning).cuda()
+        pts_W_t = torch.from_numpy(pts_W).cuda()
+        return points_skinning_t, pts_W_t
 
-    def softmax(self, logit):
+    def softmax(self, logit: torch.Tensor) -> torch.Tensor:
         return F.softmax(logit, dim=-1)
 
-    def get_skinning_loss(self):
+    def get_skinning_loss(self) -> torch.Tensor:
         pts_skinning, sampled_weights = self.sample_skinning_loss()
         pts_skinning = self.aabb.normalize(pts_skinning, sym=True)
 
@@ -117,7 +125,7 @@ class SkinningField(RigidDeform):
         return skinning_loss
 
 
-    def forward(self, gaussians, iteration, camera):
+    def forward(self, gaussians: GaussianModel, iteration: int, camera: Camera) -> GaussianModel:
         tfs = camera.bone_transforms
 
         xyz = gaussians.get_xyz
@@ -135,19 +143,19 @@ class SkinningField(RigidDeform):
 
         rotation_hat = build_rotation(gaussians._rotation)
         rotation_bar = torch.matmul(T_fwd[:, :3, :3], rotation_hat)
-        setattr(deformed_gaussians, 'rotation_precomp', rotation_bar)
+        deformed_gaussians.rotation_precomp = rotation_bar
         # deformed_gaussians._rotation = tf.matrix_to_quaternion(rotation_bar)
         # deformed_gaussians._rotation = rotation_matrix_to_quaternion(rotation_bar)
 
         return deformed_gaussians
 
-    def regularization(self):
+    def regularization(self) -> dict[str, torch.Tensor]:
         loss_skinning = self.get_skinning_loss()
         return {
             'loss_skinning': loss_skinning
         }
 
-def get_rigid_deform(cfg, metadata):
+def get_rigid_deform(cfg: DictConfig, metadata: MHRMetadata) -> RigidDeform:
     name = cfg.name
     model_dict = {
         "identity": Identity,

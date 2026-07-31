@@ -9,29 +9,30 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import os
 import sys
+from os import makedirs
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import torch
-import numpy as np
-from src.scene import Scene
-from tqdm import tqdm, trange
-from os import makedirs
-from src.gaussian_renderer import render
-import torchvision
-from src.utils.general_utils import fix_random
-from src.scene import GaussianModel
-
-from src.utils.general_utils import PSEvaluator
-
 import hydra
-from omegaconf import OmegaConf
+import numpy as np
+import torch
+import torchvision
 import wandb
+from omegaconf import DictConfig, OmegaConf
+from tqdm import trange
 
-def predict(config):
+from src.gaussian_renderer import render
+from src.scene import GaussianModel, Scene
+from src.utils.general_utils import PSEvaluator, fix_random
+
+
+def predict(config: DictConfig) -> None:
     with torch.set_grad_enabled(False):
         gaussians = GaussianModel(config.model.gaussian)
         scene = Scene(config, gaussians, config.exp_dir)
@@ -77,7 +78,7 @@ def predict(config):
 
 
 
-def test(config):
+def test(config: DictConfig) -> None:
     with torch.no_grad():
         gaussians = GaussianModel(config.model.gaussian)
         scene = Scene(config, gaussians, config.exp_dir)
@@ -152,7 +153,7 @@ def test(config):
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
-def main(config):
+def main(config: DictConfig) -> None:
     OmegaConf.set_struct(config, False)
     config.dataset.preload = False
 
@@ -181,7 +182,7 @@ def main(config):
         project='gaussian-splatting-avatar-test',
         entity='fast-avatar',
         dir=config.exp_dir,
-        config=OmegaConf.to_container(config, resolve=True),
+        config=cast("dict[str, object]", OmegaConf.to_container(config, resolve=True)),
         settings=wandb.Settings(start_method='fork'),
     )
 

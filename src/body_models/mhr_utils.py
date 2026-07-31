@@ -8,6 +8,8 @@ Split into its own module (rather than living in dataset/mhr_native.py) so that
 models/pose_correction/pose_correction.py can import it without a circular dependency:
 dataset/__init__.py is pulled in transitively by scene -> models -> pose_correction.
 """
+from __future__ import annotations
+
 import torch
 
 # Empirically-found "big pose" (SMPL star/Vitruvian-pose analogue) dims in MHR's
