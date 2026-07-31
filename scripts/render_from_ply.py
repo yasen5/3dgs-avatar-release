@@ -16,9 +16,14 @@
 # verify that a ply + converter-weights reload reproduces byte-identical
 # renders to loading the full .pth checkpoint directly.
 
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import torch
 from src.scene import Scene, GaussianModel
-import os
 from tqdm import trange
 from os import makedirs
 from src.gaussian_renderer import render
@@ -28,7 +33,7 @@ import hydra
 from omegaconf import OmegaConf
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config):
     OmegaConf.set_struct(config, False)
     config.dataset.preload = False

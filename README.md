@@ -77,9 +77,9 @@ For easy comparison to our approach, we also store all our pretrained models and
 To train new networks from scratch, run
 ```shell
 # ZJU-MoCap
-python train.py dataset=zjumocap_377_mono
+python scripts/train.py dataset=zjumocap_377_mono
 # PeopleSnapshot
-python train.py dataset=ps_female_3 option=iter30k pose_correction=none 
+python scripts/train.py dataset=ps_female_3 option=iter30k pose_correction=none 
 ```
 To train on a different subject, simply choose from the configs in `configs/dataset/`.
 
@@ -89,9 +89,9 @@ We use [wandb](https://wandb.ai) for online logging, which is free of charge but
 To evaluate the method for a specified subject, run
 ```shell
 # ZJU-MoCap
-python render.py mode=test dataset.test_mode=view dataset=zjumocap_377_mono
+python scripts/render.py mode=test dataset.test_mode=view dataset=zjumocap_377_mono
 # PeopleSnapshot
-python render.py mode=test dataset.test_mode=pose pose_correction=none dataset=ps_female_3
+python scripts/render.py mode=test dataset.test_mode=pose pose_correction=none dataset=ps_female_3
 ```
 
 ## Test on out-of-distribution poses
@@ -100,7 +100,7 @@ and extract under the corresponding subject folder `${ZJU_ROOT}/CoreView_${SUBJE
 
 To animate the subject under out-of-distribution poses, run
 ```shell
-python render.py mode=predict dataset.predict_seq=0 dataset=zjumocap_377_mono
+python scripts/render.py mode=predict dataset.predict_seq=0 dataset=zjumocap_377_mono
 ```
 
 We provide four preprocessed sequences for each subject of ZJU-MoCap, 

@@ -10,6 +10,11 @@
 #
 
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import cv2
 import numpy as np
 import torch
@@ -296,7 +301,7 @@ def validation(iteration, testing_iterations, testing_interval, scene : Scene, e
     torch.cuda.empty_cache()
     scene.train()
 
-@hydra.main(version_base=None, config_path="configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config):
     print(OmegaConf.to_yaml(config))
     OmegaConf.set_struct(config, False) # allow adding new values to config

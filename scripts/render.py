@@ -9,10 +9,15 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import torch
 import numpy as np
 from src.scene import Scene
-import os
 from tqdm import tqdm, trange
 from os import makedirs
 from src.gaussian_renderer import render
@@ -146,7 +151,7 @@ def test(config):
                  time=_time)
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config):
     OmegaConf.set_struct(config, False)
     config.dataset.preload = False
