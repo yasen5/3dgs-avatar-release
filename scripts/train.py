@@ -238,7 +238,7 @@ def training(config: DictConfig) -> None:
                     gaussians.densify_and_prune(opt, scene, size_threshold)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    gaussians.reset_opacity(opt.opacity_reset_value)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -278,10 +278,10 @@ def validation(
 
     for val_config in validation_configs:
         if val_config['cameras'] and len(val_config['cameras']) > 0:
-            l1_test = torch.tensor(0.0)
-            psnr_test = torch.tensor(0.0)
-            ssim_test = torch.tensor(0.0)
-            lpips_test = torch.tensor(0.0)
+            l1_test = torch.tensor(0.0, device="cuda")
+            psnr_test = torch.tensor(0.0, device="cuda")
+            ssim_test = torch.tensor(0.0, device="cuda")
+            lpips_test = torch.tensor(0.0, device="cuda")
             examples = []
             for idx, data_idx in enumerate(val_config['cameras']):
                 data = getattr(scene, val_config['name'] + '_dataset')[data_idx]

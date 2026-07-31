@@ -370,9 +370,9 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
-    def reset_opacity(self) -> None:
+    def reset_opacity(self, opacity_reset_value: float) -> None:
         opacities_new = inverse_sigmoid(
-            torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * self.cfg.opacity_reset_value)
+            torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * opacity_reset_value)
         )
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
