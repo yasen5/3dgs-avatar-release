@@ -25,6 +25,16 @@ model:
     init_opacity: 0.1
   pose_correction:
     name: direct
+    # disables gradient updates for this component's learnable parameters
+    # (e.g. to freeze a pretrained/loaded checkpoint while training the rest)
+    disable_grad: false
+  deformer:
+    rigid:
+      disable_grad: false
+    non_rigid:
+      disable_grad: false
+  texture:
+    disable_grad: false
 
 dataset:
   preload: true

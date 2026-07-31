@@ -25,19 +25,26 @@ class GaussianConverter(nn.Module):
         self.deformer = get_deformer(cfg.model.deformer, metadata)
         self.texture = get_texture(cfg.model.texture, metadata)
 
+        if cfg.model.pose_correction.get('disable_grad', False):
+            self.pose_correction.requires_grad_(False)
+        if cfg.model.texture.get('disable_grad', False):
+            self.texture.requires_grad_(False)
+
         self.set_optimizer()
 
     def set_optimizer(self) -> None:
         opt_params = [
-            {'params': self.deformer.rigid.parameters(), 'lr': self.cfg.opt.rigid_lr},
-            {'params': [p for n, p in self.deformer.non_rigid.named_parameters() if 'latent' not in n],
+            {'params': [p for p in self.deformer.rigid.parameters() if p.requires_grad],
+             'lr': self.cfg.opt.rigid_lr},
+            {'params': [p for n, p in self.deformer.non_rigid.named_parameters() if 'latent' not in n and p.requires_grad],
              'lr': self.cfg.opt.non_rigid_lr},
-            {'params': [p for n, p in self.deformer.non_rigid.named_parameters() if 'latent' in n],
+            {'params': [p for n, p in self.deformer.non_rigid.named_parameters() if 'latent' in n and p.requires_grad],
              'lr': self.cfg.opt.nr_latent_lr, 'weight_decay': self.cfg.opt.latent_weight_decay},
-            {'params': self.pose_correction.parameters(), 'lr': self.cfg.opt.pose_correction_lr},
-            {'params': [p for n, p in self.texture.named_parameters() if 'latent' not in n],
+            {'params': [p for p in self.pose_correction.parameters() if p.requires_grad],
+             'lr': self.cfg.opt.pose_correction_lr},
+            {'params': [p for n, p in self.texture.named_parameters() if 'latent' not in n and p.requires_grad],
              'lr': self.cfg.opt.texture_lr},
-            {'params': [p for n, p in self.texture.named_parameters() if 'latent' in n],
+            {'params': [p for n, p in self.texture.named_parameters() if 'latent' in n and p.requires_grad],
              'lr': self.cfg.opt.tex_latent_lr, 'weight_decay': self.cfg.opt.latent_weight_decay},
         ]
         # every param group above sets its own 'lr', so Adam's top-level lr is never used

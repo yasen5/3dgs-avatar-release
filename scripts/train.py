@@ -394,6 +394,7 @@ def main(config: DictConfig) -> None:
 
     config.exp_dir = config.get('exp_dir') or os.path.join('./exp', config.name)
     os.makedirs(config.exp_dir, exist_ok=True)
+    OmegaConf.save(config, os.path.join(config.exp_dir, "config.yaml"))
     config.checkpoint_iterations.append(config.opt.iterations)
 
     # set wandb logger

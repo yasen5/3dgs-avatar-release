@@ -18,6 +18,11 @@ class Deformer(nn.Module):
         self.rigid = get_rigid_deform(cfg.rigid, metadata)
         self.non_rigid = get_non_rigid_deform(cfg.non_rigid, metadata)
 
+        if cfg.rigid.get('disable_grad', False):
+            self.rigid.requires_grad_(False)
+        if cfg.non_rigid.get('disable_grad', False):
+            self.non_rigid.requires_grad_(False)
+
     def forward(
         self, gaussians: GaussianModel, camera: Camera, iteration: int, compute_loss: bool = True
     ) -> tuple[GaussianModel, dict[str, torch.Tensor]]:
