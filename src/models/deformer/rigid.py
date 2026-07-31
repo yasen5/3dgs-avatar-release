@@ -5,8 +5,8 @@ import torch.nn.functional as F
 
 import igl
 
-from utils.general_utils import build_rotation
-from models.network_utils import get_skinning_mlp
+from src.utils.general_utils import build_rotation
+from src.models.network_utils import get_skinning_mlp
 
 class RigidDeform(nn.Module):
     def __init__(self, cfg):

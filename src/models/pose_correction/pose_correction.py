@@ -2,8 +2,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from body_models import mhr_lbs
-from body_models.mhr_utils import local_joint_rotmats
+from src.body_models import mhr_lbs
+from src.body_models.mhr_utils import local_joint_rotmats
 
 
 class NoPoseCorrection(nn.Module):

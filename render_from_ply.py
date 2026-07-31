@@ -17,11 +17,11 @@
 # renders to loading the full .pth checkpoint directly.
 
 import torch
-from scene import Scene, GaussianModel
+from src.scene import Scene, GaussianModel
 import os
 from tqdm import trange
 from os import makedirs
-from gaussian_renderer import render
+from src.gaussian_renderer import render
 import torchvision
 
 import hydra

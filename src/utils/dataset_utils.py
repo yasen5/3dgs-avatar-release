@@ -1,7 +1,7 @@
 import math
 import numpy as np
 import torch
-from utils.graphics_utils import BasicPointCloud
+from src.utils.graphics_utils import BasicPointCloud
 from plyfile import PlyData, PlyElement
 
 def fetchPly(path):

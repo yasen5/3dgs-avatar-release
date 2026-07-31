@@ -1,7 +1,7 @@
 import torch.nn as nn
 
-from models.deformer.rigid import get_rigid_deform
-from models.deformer.non_rigid import get_non_rigid_deform
+from src.models.deformer.rigid import get_rigid_deform
+from src.models.deformer.non_rigid import get_non_rigid_deform
 
 class Deformer(nn.Module):
     def __init__(self, cfg, metadata):

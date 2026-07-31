@@ -11,16 +11,16 @@
 
 import torch
 import numpy as np
-from scene import Scene
+from src.scene import Scene
 import os
 from tqdm import tqdm, trange
 from os import makedirs
-from gaussian_renderer import render
+from src.gaussian_renderer import render
 import torchvision
-from utils.general_utils import fix_random
-from scene import GaussianModel
+from src.utils.general_utils import fix_random
+from src.scene import GaussianModel
 
-from utils.general_utils import PSEvaluator
+from src.utils.general_utils import PSEvaluator
 
 import hydra
 from omegaconf import OmegaConf

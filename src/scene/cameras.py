@@ -12,7 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from src.utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera:
     def __init__(self, camera=None, **kwargs):

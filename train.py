@@ -15,12 +15,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from random import randint
-from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render
-from scene import Scene, GaussianModel
-from utils.general_utils import fix_random, PSEvaluator
+from src.utils.loss_utils import l1_loss, ssim
+from src.gaussian_renderer import render
+from src.scene import Scene, GaussianModel
+from src.utils.general_utils import fix_random, PSEvaluator
 from tqdm import tqdm
-from utils.loss_utils import full_aiap_loss
+from src.utils.loss_utils import full_aiap_loss
 
 import hydra
 from omegaconf import OmegaConf

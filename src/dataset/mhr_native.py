@@ -28,11 +28,11 @@ import torch
 from torch.utils.data import Dataset
 import trimesh
 
-from body_models import mhr_lbs
-from body_models.mhr_utils import build_big_pose_model_params, local_joint_rotmats
-from utils.graphics_utils import focal2fov
-from utils.dataset_utils import fetchPly, storePly, AABB
-from scene.cameras import Camera
+from src.body_models import mhr_lbs
+from src.body_models.mhr_utils import build_big_pose_model_params, local_joint_rotmats
+from src.utils.graphics_utils import focal2fov
+from src.utils.dataset_utils import fetchPly, storePly, AABB
+from src.scene.cameras import Camera
 
 # Scene-scale constant (spatial_lr_scale / densify-threshold normalization) verified
 # to work well for this data scale; not a per-camera-rig quantity.

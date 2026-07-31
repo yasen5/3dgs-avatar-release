@@ -11,15 +11,15 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from src.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import torch.nn.functional as F
 import os
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from src.utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from src.utils.graphics_utils import BasicPointCloud
+from src.utils.general_utils import strip_symmetric, build_scaling_rotation
 
 import trimesh
 import igl

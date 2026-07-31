@@ -11,7 +11,7 @@
 
 import os
 import torch
-from scene import Scene, GaussianModel
+from src.scene import Scene, GaussianModel
 
 import hydra
 from omegaconf import OmegaConf

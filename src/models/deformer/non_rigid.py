@@ -2,11 +2,11 @@ import torch
 import torch.nn as nn
 import pytorch3d.transforms as tf
 
-from models.network_utils import (HierarchicalPoseEncoder,
+from src.models.network_utils import (HierarchicalPoseEncoder,
                                   VanillaCondMLP,
                                   HannwCondMLP,
                                   HashGrid)
-from utils.general_utils import quaternion_multiply
+from src.utils.general_utils import quaternion_multiply
 
 class NonRigidDeform(nn.Module):
     def __init__(self, cfg):

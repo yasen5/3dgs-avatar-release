@@ -11,9 +11,9 @@
 
 import os
 import torch
-from models import GaussianConverter
-from scene.gaussian_model import GaussianModel
-from dataset import load_dataset
+from src.models import GaussianConverter
+from src.scene.gaussian_model import GaussianModel
+from src.dataset import load_dataset
 
 
 class Scene:

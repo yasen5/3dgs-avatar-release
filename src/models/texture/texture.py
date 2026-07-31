@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 
-from utils.sh_utils import eval_sh, eval_sh_bases, augm_rots
-from utils.general_utils import build_rotation
-from models.network_utils import VanillaCondMLP
+from src.utils.sh_utils import eval_sh, eval_sh_bases, augm_rots
+from src.utils.general_utils import build_rotation
+from src.models.network_utils import VanillaCondMLP
 
 class ColorPrecompute(nn.Module):
     def __init__(self, cfg, metadata):
