@@ -1,0 +1,43 @@
+# @package _global_
+# Ablation: zero every loss but the mask term, and freeze the canonical
+# Gaussians (xyz/opacity/scale/rotation/features) plus the appearance
+# (texture) and pose-correction networks, so only the deformer (rigid
+# skinning field + non-rigid net) can receive gradient and update. Also
+# lifts the non-rigid net's warm-up delay so it's active from iteration 0 --
+# useful for short ablation runs (< the default 3000-iter delay).
+
+opt:
+  lambda_l1: 0.
+  lambda_dssim: 0.
+  lambda_perceptual: 0.
+  lambda_opacity: 0.
+  lambda_skinning: 0.
+  lambda_pose: 0.
+  lambda_aiap_xyz: 0.
+  lambda_aiap_cov: 0.
+  lambda_nr_xyz: 0.
+  lambda_nr_scale: 0.
+  lambda_nr_rot: 0.
+
+  mask_loss_type: l1
+  lambda_mask: 0.1
+
+  # freeze canonical Gaussian attributes
+  position_lr_init: 0.
+  position_lr_final: 0.
+  feature_lr: 0.
+  opacity_lr: 0.
+  scaling_lr: 0.
+  rotation_lr: 0.
+
+  # freeze appearance/texture and pose-correction networks
+  texture_lr: 0.
+  tex_latent_lr: 0.
+  pose_correction_lr: 0.
+
+  densify_until_iter: 0
+
+model:
+  deformer:
+    non_rigid:
+      delay: 0
