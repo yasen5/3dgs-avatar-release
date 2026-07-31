@@ -1,4 +1,4 @@
-"""Render side-by-side MHR and SMPL-X mesh projection overlays for ZJU-MoCap.
+"""Render side-by-side MHR and SMPL mesh projection overlays for ZJU-MoCap.
 
 The expected subject layout is::
 
@@ -6,7 +6,9 @@ The expected subject layout is::
         Camera_B1/
             images/000000.jpg (or .png)
             results/raw/000000.npz
-            results/smplx/smplx_params.npz
+        annots.npy
+        new_params/0.npy
+        new_vertices/0.npy
 
 The MHR raw files are the native SAM-3D-Body outputs.  Their ``vertices`` are
 model-space vertices and ``pred_cam_t`` is the camera-space translation, so the
@@ -14,20 +16,22 @@ projected mesh is ``vertices + pred_cam_t``.  If a raw file does not contain
 ``vertices``, the script recomputes them from ``shape_params`` and
 ``mhr_model_params`` with the repository's MHR adapter.
 
-SMPL-X parameters are expected to contain ``global_orient``, ``body_pose``,
-``betas``, and ``transl``.  Optional jaw, eye, hand, and expression parameters
-are used when present and otherwise set to zero.
+The native ZJU files in ``new_params`` are dictionaries containing ``Rh``,
+``Th``, ``poses``, and ``shapes``.  They are the standard 72-parameter SMPL
+fits: root orientation, 69 body-pose values, translation, and 10 shape
+coefficients.  ``Th`` is in the ZJU world coordinate system and is transformed
+with the selected camera from ``annots.npy`` before projection.
 
 Example:
 
     python render_zju_mhr_smplx_overlay.py \
         --subject-dir /mnt/ssd2/better_rigs_runs/zju_377_prep/dataset/zju_mocap/CoreView_377 \
-        --smplx-model /mnt/ssd2/lhmpp_checkpoints/models/Damo_XR_Lab--LHMPP-Prior/snapshots/master/human_model_files/smplx/SMPLX_NEUTRAL.npz \
-        --output-dir /mnt/ssd2/better_rigs_runs/zju_377_prep/overlays/mhr_vs_smplx \
+        --smpl-vertices-dir /mnt/ssd2/data/other/3d-human-datasets/zju_mocap_raw/CoreView_377/new_vertices \
+        --output-dir /mnt/ssd2/better_rigs_runs/zju_377_prep/overlays/mhr_vs_smpl \
         --start-frame 0 --end-frame 570 --stride 10
 
 Each output is a horizontal concatenation of the same source image with the
-MHR overlay on the left and the SMPL-X overlay on the right.
+MHR overlay on the left and the SMPL overlay on the right.
 """
 from __future__ import annotations
 
@@ -41,32 +45,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import cv2
 import numpy as np
 import numpy.typing as npt
-import smplx
 import torch
 
 from src.body_models import mhr_lbs
 
 
-OPTIONAL_SMPLX_FIELDS = {
-    "jaw_pose": 3,
-    "leye_pose": 3,
-    "reye_pose": 3,
-    "left_hand_pose": 45,
-    "right_hand_pose": 45,
-}
-OPTIONAL_SMPLX_ALIASES = {
-    "jaw_pose": ("jaw_pose",),
-    "leye_pose": ("leye_pose",),
-    "reye_pose": ("reye_pose",),
-    "left_hand_pose": ("left_hand_pose", "lhand_pose"),
-    "right_hand_pose": ("right_hand_pose", "rhand_pose"),
-    "expression": ("expression", "expr"),
-}
+Projection = Tuple[float, float, float, float]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render horizontal MHR|SMPL-X projection-fit overlays for ZJU-MoCap."
+        description="Render horizontal MHR|SMPL projection-fit overlays for ZJU-MoCap."
     )
     parser.add_argument(
         "--subject-dir",
@@ -86,16 +75,29 @@ def parse_args() -> argparse.Namespace:
         help="MHR raw-fit directory (default: <camera>/results/raw).",
     )
     parser.add_argument(
-        "--smplx-params",
+        "--smpl-params-dir",
         type=Path,
         default=None,
-        help="SMPL-X parameter NPZ (default: <camera>/results/smplx/smplx_params.npz).",
+        help=(
+            "Directory containing native ZJU SMPL files such as new_params/0.npy. "
+            "If omitted, searches the subject and resolved image-source directories."
+        ),
     )
     parser.add_argument(
-        "--smplx-model",
+        "--smpl-vertices-dir",
         type=Path,
-        required=True,
-        help="SMPL-X model directory or direct SMPLX_NEUTRAL.npz file.",
+        default=None,
+        help=(
+            "Directory containing precomputed posed SMPL vertices such as "
+            "new_vertices/0.npy. If omitted, searches the subject and resolved "
+            "image-source directories."
+        ),
+    )
+    parser.add_argument(
+        "--smpl-model",
+        type=Path,
+        default=None,
+        help="Optional SMPL model for fallback evaluation when vertices are unavailable.",
     )
     parser.add_argument(
         "--mhr-model",
@@ -144,7 +146,7 @@ def parse_args() -> argparse.Namespace:
         "--gender",
         default="neutral",
         choices=("neutral", "male", "female"),
-        help="SMPL-X gender/model filename (default: neutral).",
+        help="SMPL gender/model filename (default: neutral).",
     )
     parser.add_argument(
         "--overwrite",
@@ -192,134 +194,189 @@ def image_path_for(camera_dir: Path, frame_stem: str) -> Path:
     )
 
 
-def get_first_field(data: Mapping[str, npt.NDArray[np.floating[Any]]], names: Sequence[str], label: str) -> npt.NDArray[np.floating[Any]]:
-    for name in names:
-        if name in data:
-            return np.asarray(data[name], dtype=np.float32)
-    raise KeyError(f"SMPL-X fit is missing {label}; tried {', '.join(names)}")
+def resolve_smpl_params_dir(
+    subject_dir: Path,
+    camera_dir: Path,
+    requested: Path | None,
+) -> Path:
+    """Find native ZJU ``new_params``/``params`` files for this subject."""
+    if requested is not None:
+        if not requested.is_dir():
+            raise FileNotFoundError(f"SMPL parameter directory not found: {requested}")
+        return requested
+
+    candidates = [subject_dir / "new_params", subject_dir / "params"]
+
+    # The prepared ZJU images are symlinks to the original release.  Use that
+    # source subject as a fallback so the prepared MHR layout can be rendered
+    # without copying the original per-frame SMPL files.
+    image_dir = camera_dir / "images"
+    for image_path in sorted(image_dir.glob("*")):
+        try:
+            source_image = image_path.resolve()
+        except OSError:
+            continue
+        source_camera = source_image.parent
+        if source_camera.name.startswith("Camera_B"):
+            source_subject = source_camera.parent
+            candidates.extend((source_subject / "new_params", source_subject / "params"))
+        break
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    tried = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f"Could not find native ZJU SMPL parameters; tried {tried}")
 
 
-def frame_array(
-    value: npt.NDArray[np.floating[Any]],
-    num_frames: int,
-    width: int,
-    name: str,
+def resolve_smpl_vertices_dir(
+    subject_dir: Path,
+    camera_dir: Path,
+    requested: Path | None,
+) -> Path | None:
+    """Find precomputed posed SMPL vertices, if available."""
+    if requested is not None:
+        if not requested.is_dir():
+            raise FileNotFoundError(f"SMPL vertex directory not found: {requested}")
+        return requested
+
+    candidates = [subject_dir / "new_vertices", subject_dir / "vertices"]
+    image_dir = camera_dir / "images"
+    for image_path in sorted(image_dir.glob("*")):
+        try:
+            source_image = image_path.resolve()
+        except OSError:
+            continue
+        source_camera = source_image.parent
+        if source_camera.name.startswith("Camera_B"):
+            source_subject = source_camera.parent
+            candidates.extend((source_subject / "new_vertices", source_subject / "vertices"))
+        break
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def smpl_param_paths(params_dir: Path) -> Dict[int, Path]:
+    paths = sorted(params_dir.glob("*.npy"), key=numeric_frame_id)
+    if not paths:
+        raise FileNotFoundError(f"No ZJU SMPL parameter files found in {params_dir}")
+    result = {numeric_frame_id(path): path for path in paths}
+    if len(result) != len(paths):
+        raise ValueError(f"Duplicate numeric frame names in {params_dir}")
+    return result
+
+
+def load_smpl_vertices(
+    vertices_dir: Path,
+    frame_indices: Sequence[int],
 ) -> npt.NDArray[np.floating[Any]]:
-    """Normalize a constant or per-frame vector to ``(num_frames, width)``."""
-    value = np.asarray(value, dtype=np.float32)
-    if value.ndim >= 2 and value.shape[0] in (1, num_frames):
-        value = value.reshape(value.shape[0], -1)
-    if value.shape == (width,):
-        return np.broadcast_to(value, (num_frames, width)).copy()
-    if value.shape == (1, width):
-        return np.broadcast_to(value, (num_frames, width)).copy()
-    if value.shape == (num_frames, width):
-        return value
-    raise ValueError(
-        f"SMPL-X field {name!r} must have shape ({width},), (1, {width}), "
-        f"or ({num_frames}, {width}); got {value.shape}"
-    )
+    paths = smpl_param_paths(vertices_dir)
+    vertices = []
+    for frame_index in frame_indices:
+        path = paths.get(frame_index)
+        if path is None:
+            raise FileNotFoundError(
+                f"No precomputed SMPL vertices for frame {frame_index} in {vertices_dir}"
+            )
+        value = np.asarray(np.load(path), dtype=np.float32)
+        if value.shape != (6890, 3):
+            raise ValueError(f"Expected SMPL vertices with shape (6890, 3) in {path}, got {value.shape}")
+        vertices.append(value)
+    result = np.stack(vertices, axis=0)
+    if not np.isfinite(result).all():
+        raise ValueError(f"Precomputed SMPL vertices contain non-finite values: {vertices_dir}")
+    return result
 
 
-def load_smplx_fit(path: Path) -> Tuple[Dict[str, npt.NDArray[np.floating[Any]]], int]:
-    if not path.is_file():
-        raise FileNotFoundError(f"SMPL-X parameter file not found: {path}")
-    with np.load(path, allow_pickle=False) as loaded:
-        data = {name: np.asarray(loaded[name]) for name in loaded.files}
+def load_smpl_fit(
+    params_dir: Path,
+    frame_indices: Sequence[int],
+) -> Dict[str, npt.NDArray[np.floating[Any]]]:
+    """Load native ZJU SMPL dictionaries in the order requested by the MHR fits."""
+    paths = smpl_param_paths(params_dir)
+    records: List[Dict[str, npt.NDArray[np.floating[Any]]]] = []
+    for frame_index in frame_indices:
+        path = paths.get(frame_index)
+        if path is None:
+            raise FileNotFoundError(
+                f"No ZJU SMPL parameter for frame {frame_index} in {params_dir}"
+            )
+        loaded = np.load(path, allow_pickle=True)
+        if not isinstance(loaded, np.ndarray) or loaded.shape != () or loaded.dtype != object:
+            raise ValueError(f"Expected a pickled parameter dictionary in {path}")
+        data = loaded.item()
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected a parameter dictionary in {path}")
 
-    global_orient = get_first_field(
-        data, ("global_orient", "global_rot", "root_pose"), "global orientation"
-    )
-    if global_orient.ndim == 1:
-        num_frames = 1
-    elif global_orient.ndim >= 2:
-        num_frames = global_orient.shape[0]
-    else:
-        raise ValueError(f"Unexpected global orientation shape: {global_orient.shape}")
+        missing = [name for name in ("Rh", "Th", "poses", "shapes") if name not in data]
+        if missing:
+            raise KeyError(f"ZJU SMPL file {path} is missing {missing}")
+        root_orient = np.asarray(data["Rh"], dtype=np.float32).reshape(-1)
+        transl = np.asarray(data["Th"], dtype=np.float32).reshape(-1)
+        poses = np.asarray(data["poses"], dtype=np.float32).reshape(-1)
+        betas = np.asarray(data["shapes"], dtype=np.float32).reshape(-1)
+        if root_orient.shape != (3,) or transl.shape != (3,) or poses.shape != (72,):
+            raise ValueError(
+                f"Unexpected SMPL shapes in {path}: Rh={root_orient.shape}, "
+                f"Th={transl.shape}, poses={poses.shape}"
+            )
+        records.append(
+            {
+                "global_orient": root_orient,
+                # smplx.SMPL expects all 23 non-root joints (69 values).
+                "body_pose": poses[3:],
+                "betas": betas,
+                "transl": transl,
+            }
+        )
 
-    betas = get_first_field(data, ("betas", "shape"), "shape coefficients")
-    betas_flat = betas.reshape(-1) if betas.ndim == 1 else betas.reshape(betas.shape[0], -1)
-    num_betas = betas_flat.shape[-1]
-
-    fields: Dict[str, npt.NDArray[np.floating[Any]]] = {
-        "global_orient": frame_array(global_orient, num_frames, 3, "global_orient"),
-        "body_pose": frame_array(
-            get_first_field(data, ("body_pose",), "body pose"),
-            num_frames,
-            63,
-            "body_pose",
-        ),
-        "betas": frame_array(
-            betas,
-            num_frames,
-            num_betas,
-            "betas",
-        ),
-        "transl": frame_array(
-            get_first_field(data, ("transl", "translation", "trans"), "translation"),
-            num_frames,
-            3,
-            "transl",
-        ),
+    fields = {
+        name: np.stack([record[name] for record in records], axis=0)
+        for name in records[0]
     }
-
-    for name, width in OPTIONAL_SMPLX_FIELDS.items():
-        value = next((data[alias] for alias in OPTIONAL_SMPLX_ALIASES[name] if alias in data), None)
-        if value is not None:
-            fields[name] = frame_array(value, num_frames, width, name)
-        else:
-            fields[name] = np.zeros((num_frames, width), dtype=np.float32)
-
-    expression = next((data[alias] for alias in OPTIONAL_SMPLX_ALIASES["expression"] if alias in data), None)
-    if expression is None:
-        fields["expression"] = np.zeros((num_frames, 10), dtype=np.float32)
-    else:
-        expression = np.asarray(expression, dtype=np.float32)
-        if expression.ndim == 1:
-            expression_width = expression.shape[0]
-        else:
-            expression_width = expression.reshape(expression.shape[0], -1).shape[1]
-        fields["expression"] = frame_array(expression, num_frames, expression_width, "expression")
-
     if not np.isfinite(np.concatenate(list(fields.values()), axis=1)).all():
-        raise ValueError(f"SMPL-X parameter file contains non-finite values: {path}")
-    return fields, num_frames
+        raise ValueError(f"ZJU SMPL parameters contain non-finite values: {params_dir}")
+    return fields
 
 
-def resolve_smplx_model(path: Path, gender: str) -> Path:
+def resolve_smpl_model(path: Path, gender: str) -> Path:
     """Resolve a model directory to the concrete file accepted by smplx.create."""
     if path.is_file():
         return path
     if not path.is_dir():
-        raise FileNotFoundError(f"SMPL-X model path not found: {path}")
+        raise FileNotFoundError(f"SMPL model path not found: {path}")
 
     candidates = (
-        path / f"SMPLX_{gender.upper()}.npz",
-        path / "smplx" / f"SMPLX_{gender.upper()}.npz",
+        path / f"SMPL_{gender.upper()}.pkl",
+        path / "smpl" / f"SMPL_{gender.upper()}.pkl",
+        path / f"SMPL_{gender.upper()}.npz",
+        path / "smpl" / f"SMPL_{gender.upper()}.npz",
     )
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     tried = ", ".join(str(candidate) for candidate in candidates)
-    raise FileNotFoundError(f"Could not find an SMPL-X model; tried {tried}")
+    raise FileNotFoundError(f"Could not find an SMPL model; tried {tried}")
 
 
-def make_smplx_model(
+def make_smpl_model(
     model_path: Path,
     gender: str,
     num_betas: int,
-    num_expression_coeffs: int,
     device: torch.device,
 ) -> torch.nn.Module:
-    model_file = resolve_smplx_model(model_path, gender)
+    import smplx
+
+    model_file = resolve_smpl_model(model_path, gender)
     model: torch.nn.Module = smplx.create(
         model_path=str(model_file),
-        model_type="smplx",
+        model_type="smpl",
         gender=gender,
         ext=model_file.suffix.lstrip("."),
         num_betas=num_betas,
-        num_expression_coeffs=num_expression_coeffs,
-        use_pca=False,
         batch_size=1,
     ).to(device)
     model.eval()
@@ -328,7 +385,50 @@ def make_smplx_model(
     return model
 
 
-def project_points(vertices: npt.NDArray[np.floating[Any]], focal: float, width: int, height: int) -> npt.NDArray[np.floating[Any]]:
+def load_zju_camera(
+    subject_dir: Path,
+    camera_name: str,
+) -> Tuple[npt.NDArray[np.floating[Any]], npt.NDArray[np.floating[Any]], npt.NDArray[np.floating[Any]], npt.NDArray[np.floating[Any]]]:
+    """Load ``R``, ``T``, ``K``, and ``D`` for a ZJU camera."""
+    annots_path = subject_dir / "annots.npy"
+    if not annots_path.is_file():
+        raise FileNotFoundError(f"ZJU annotation file not found: {annots_path}")
+    annots = np.load(annots_path, allow_pickle=True).item()
+    if not camera_name.startswith("Camera_B"):
+        raise ValueError(f"Expected a ZJU camera such as Camera_B1, got {camera_name!r}")
+    try:
+        camera_index = int(camera_name.removeprefix("Camera_B")) - 1
+    except ValueError as exc:
+        raise ValueError(f"Expected a ZJU camera such as Camera_B1, got {camera_name!r}") from exc
+
+    camera_names = {
+        Path(path).parent.name
+        for path in annots["ims"][0]["ims"]
+    }
+    if camera_name not in camera_names:
+        raise ValueError(
+            f"{camera_name} is not present in {annots_path}; "
+            f"available cameras: {sorted(camera_names)}"
+        )
+    cams = annots["cams"]
+    if camera_index < 0 or camera_index >= len(cams["K"]):
+        raise ValueError(f"Camera index out of range for {camera_name}: {camera_index}")
+
+    K = np.asarray(cams["K"][camera_index], dtype=np.float32)
+    D = np.asarray(cams["D"][camera_index], dtype=np.float32).reshape(-1)
+    R = np.asarray(cams["R"][camera_index], dtype=np.float32)
+    # ZJU stores T in millimetres; SMPL vertices and MHR translations are in m.
+    T = np.asarray(cams["T"][camera_index], dtype=np.float32).reshape(3) / 1000.0
+    if K.shape != (3, 3) or R.shape != (3, 3):
+        raise ValueError(f"Unexpected camera shapes in {annots_path}: K={K.shape}, R={R.shape}")
+    return R, T, K, D
+
+
+def project_points(
+    vertices: npt.NDArray[np.floating[Any]],
+    projection: Projection,
+    distortion: npt.NDArray[np.floating[Any]] | None = None,
+) -> npt.NDArray[np.floating[Any]]:
     vertices = np.asarray(vertices, dtype=np.float32)
     if vertices.ndim != 2 or vertices.shape[1] != 3:
         raise ValueError(f"Expected vertices with shape (N, 3), got {vertices.shape}")
@@ -336,22 +436,38 @@ def project_points(vertices: npt.NDArray[np.floating[Any]], focal: float, width:
     valid = np.isfinite(vertices).all(axis=1) & (z > 1e-6)
     uv = np.empty((vertices.shape[0], 2), dtype=np.float32)
     uv[:] = np.nan
-    uv[valid, 0] = focal * vertices[valid, 0] / z[valid] + width / 2.0
-    uv[valid, 1] = focal * vertices[valid, 1] / z[valid] + height / 2.0
+    fx, fy, cx, cy = projection
+    if distortion is None or not np.any(np.abs(distortion) > 1e-12):
+        uv[valid, 0] = fx * vertices[valid, 0] / z[valid] + cx
+        uv[valid, 1] = fy * vertices[valid, 1] / z[valid] + cy
+    else:
+        camera_matrix = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        projected, _ = cv2.projectPoints(
+            vertices[valid].reshape(-1, 1, 3),
+            np.zeros(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            camera_matrix,
+            np.asarray(distortion, dtype=np.float32),
+        )
+        uv[valid] = projected.reshape(-1, 2)
     return uv
 
 
 def draw_projected_vertices(
     image: npt.NDArray[np.uint8],
     vertices: npt.NDArray[np.floating[Any]],
-    focal: float,
+    projection: Projection,
     color: Tuple[int, int, int],
     vertex_stride: int,
     point_radius: int,
     alpha: float,
+    distortion: npt.NDArray[np.floating[Any]] | None = None,
 ) -> npt.NDArray[np.uint8]:
     height, width = image.shape[:2]
-    uv = project_points(vertices[::vertex_stride], focal, width, height)
+    uv = project_points(vertices[::vertex_stride], projection, distortion)
     valid = np.isfinite(uv).all(axis=1)
     uv = np.rint(uv[valid]).astype(np.int32)
     if uv.size:
@@ -448,43 +564,70 @@ def render(args: argparse.Namespace) -> int:
     subject_dir = args.subject_dir
     camera_dir = subject_dir / args.camera_name
     raw_dir = args.raw_dir or camera_dir / "results" / "raw"
-    smplx_params_path = args.smplx_params or camera_dir / "results" / "smplx" / "smplx_params.npz"
 
     all_raw_paths = raw_fit_paths(raw_dir)
     paths = selected_paths(all_raw_paths, args.start_frame, args.end_frame, args.stride)
-    smplx_fields, num_smplx_frames = load_smplx_fit(smplx_params_path)
-    max_frame = max(numeric_frame_id(path) for path in paths)
-    if max_frame >= num_smplx_frames:
-        raise ValueError(
-            f"SMPL-X fit has {num_smplx_frames} frames but frame {max_frame} was requested"
-        )
+    frame_indices = [numeric_frame_id(path) for path in paths]
+    smpl_vertices_dir = resolve_smpl_vertices_dir(
+        subject_dir,
+        camera_dir,
+        args.smpl_vertices_dir,
+    )
+    smpl_vertices_world_all = (
+        load_smpl_vertices(smpl_vertices_dir, frame_indices)
+        if smpl_vertices_dir is not None
+        else None
+    )
+    camera_R, camera_T, camera_K, camera_D = load_zju_camera(subject_dir, args.camera_name)
 
     device = torch.device(args.device)
-    model = make_smplx_model(
-        args.smplx_model,
-        args.gender,
-        smplx_fields["betas"].shape[1],
-        smplx_fields["expression"].shape[1],
-        device,
-    )
+    model = None
+    smpl_fields = None
+    if smpl_vertices_world_all is None:
+        if args.smpl_model is None:
+            raise FileNotFoundError(
+                "No precomputed SMPL vertices found. Supply --smpl-vertices-dir "
+                "or --smpl-model together with --smpl-params-dir."
+            )
+        smpl_params_dir = resolve_smpl_params_dir(
+            subject_dir,
+            camera_dir,
+            args.smpl_params_dir,
+        )
+        smpl_fields = load_smpl_fit(smpl_params_dir, frame_indices)
+        model = make_smpl_model(
+            args.smpl_model,
+            args.gender,
+            smpl_fields["betas"].shape[1],
+            device,
+        )
     mhr_model = None
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     written = 0
     for batch_start in range(0, len(paths), 16):
         batch_paths = paths[batch_start : batch_start + 16]
-        frame_indices = [numeric_frame_id(path) for path in batch_paths]
-        model_inputs = {
-            name: torch.from_numpy(values[frame_indices]).to(device)
-            for name, values in smplx_fields.items()
-        }
-        with torch.inference_mode():
-            smplx_output = model(return_verts=True, **model_inputs)
-        smplx_vertices = smplx_output.vertices.detach().cpu().numpy()
+        batch_end = batch_start + len(batch_paths)
+        if smpl_vertices_world_all is not None:
+            smpl_vertices_world = smpl_vertices_world_all[batch_start:batch_end]
+        else:
+            assert model is not None and smpl_fields is not None
+            model_inputs = {
+                name: torch.from_numpy(values[batch_start:batch_end]).to(device)
+                for name, values in smpl_fields.items()
+            }
+            with torch.inference_mode():
+                smpl_output = model(return_verts=True, **model_inputs)
+            smpl_vertices_world = smpl_output.vertices.detach().cpu().numpy()
+        smpl_vertices = np.einsum(
+            "ij,bvj->bvi",
+            camera_R,
+            smpl_vertices_world,
+        ) + camera_T[None, None, :]
 
-        for local_idx, (raw_path, frame_idx) in enumerate(zip(batch_paths, frame_indices)):
+        for local_idx, raw_path in enumerate(batch_paths):
             frame_stem = raw_path.stem
-            output_path = args.output_dir / f"{frame_stem}_mhr_vs_smplx.png"
+            output_path = args.output_dir / f"{frame_stem}_mhr_vs_smpl.png"
             if output_path.exists() and not args.overwrite:
                 continue
 
@@ -497,6 +640,13 @@ def render(args: argparse.Namespace) -> int:
             if "focal_length" not in raw:
                 raise KeyError(f"MHR raw fit is missing 'focal_length': {raw_path}")
             focal = float(np.asarray(raw["focal_length"]).reshape(()))
+            mhr_projection = (focal, focal, width / 2.0, height / 2.0)
+            smpl_projection = (
+                float(camera_K[0, 0]),
+                float(camera_K[1, 1]),
+                float(camera_K[0, 2]),
+                float(camera_K[1, 2]),
+            )
 
             if "vertices" not in raw:
                 if mhr_model is None:
@@ -510,29 +660,30 @@ def render(args: argparse.Namespace) -> int:
             mhr_panel = draw_projected_vertices(
                 image,
                 mhr_vertices,
-                focal,
+                mhr_projection,
                 (0, 255, 0),
                 args.vertex_stride,
                 args.point_radius,
                 args.overlay_alpha,
             )
-            smplx_panel = draw_projected_vertices(
+            smpl_panel = draw_projected_vertices(
                 image,
-                smplx_vertices[local_idx],
-                focal,
+                smpl_vertices[local_idx],
+                smpl_projection,
                 (0, 255, 0),
                 args.vertex_stride,
                 args.point_radius,
                 args.overlay_alpha,
+                camera_D,
             )
             mhr_panel = add_label(mhr_panel, f"MHR projection fit  frame {frame_stem}")
-            smplx_panel = add_label(smplx_panel, f"SMPL-X projection fit  frame {frame_stem}")
-            concatenated = np.concatenate((mhr_panel, smplx_panel), axis=1)
+            smpl_panel = add_label(smpl_panel, f"SMPL projection fit  frame {frame_stem}")
+            concatenated = np.concatenate((mhr_panel, smpl_panel), axis=1)
             if not cv2.imwrite(str(output_path), concatenated):
                 raise RuntimeError(f"Failed to write overlay: {output_path}")
             written += 1
 
-    print(f"Wrote {written} MHR|SMPL-X overlay images to {args.output_dir}")
+    print(f"Wrote {written} MHR|SMPL overlay images to {args.output_dir}")
     return 0
 
 
