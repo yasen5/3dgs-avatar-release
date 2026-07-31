@@ -87,7 +87,24 @@ class Scene:
 
     def save(self, iteration: int) -> None:
         point_cloud_path = os.path.join(self.save_dir, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        colors = self.bake_colors(iteration)
+        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"), colors=colors)
+
+    def bake_colors(self, iteration: int, ref_view: Camera | None = None) -> torch.Tensor:
+        """Run the (pose/view-dependent) texture MLP for a single reference
+        view and freeze its output as static per-Gaussian RGB, since a PLY
+        has no notion of the pose- and view-dependent appearance this model
+        actually produces.
+        """
+        if ref_view is None:
+            ref_view = self.test_dataset[0]
+        was_training = self.converter.training
+        self.eval()
+        with torch.no_grad():
+            _, _, colors = self.convert_gaussians(ref_view, iteration, compute_loss=False)
+        if was_training:
+            self.train()
+        return colors
 
     def save_checkpoint(self, iteration: int) -> None:
         print("\n[ITER {}] Saving Checkpoint".format(iteration))

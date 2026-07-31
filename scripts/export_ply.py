@@ -40,16 +40,16 @@ def main(config: DictConfig) -> None:
             load_ckpt = os.path.join(scene.save_dir, "ckpt" + str(config.opt.iterations) + ".pth")
         scene.load_checkpoint(load_ckpt)
 
-        colors = None
+        # Appearance here is produced by a per-frame/per-view neural texture
+        # network (models/texture/texture.py), not a static per-point color
+        # -- so there is no single "true" color to store. We bake one
+        # representative snapshot (from color_ref_view, or the first test
+        # view by default) as standard red/green/blue PLY fields purely for
+        # visualization in generic viewers; the exact latent features are
+        # saved alongside it so the real model can still be reconstructed
+        # exactly.
+        view = None
         if color_ref_view is not None:
-            # Appearance here is produced by a per-frame/per-view neural
-            # texture network (models/texture/texture.py), not a static
-            # per-point color -- so there is no single "true" color to store.
-            # We bake one representative snapshot (from color_ref_view) as
-            # standard red/green/blue PLY fields purely for visualization in
-            # generic viewers; the exact latent features are saved alongside
-            # it so the real model can still be reconstructed exactly.
-            view = None
             for cand_idx in range(len(scene.test_dataset)):
                 cand = scene.test_dataset[cand_idx]
                 if cand.image_name == color_ref_view:
@@ -57,7 +57,7 @@ def main(config: DictConfig) -> None:
                     break
             if view is None:
                 raise ValueError(f"color_ref_view '{color_ref_view}' not found in test_dataset")
-            _, _, colors = scene.convert_gaussians(view, config.opt.iterations, compute_loss=False)
+        colors = scene.bake_colors(config.opt.iterations, ref_view=view)
 
         point_cloud_path = os.path.join(scene.save_dir, "point_cloud/iteration_{}".format(config.opt.iterations))
         ply_path = os.path.join(point_cloud_path, "point_cloud.ply")

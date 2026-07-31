@@ -118,17 +118,19 @@ def training(config: DictConfig) -> None:
         if iteration % opt.sh_degree_up_interval == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random data point (background-prefetched when num_workers>0);
-        # DataLoader(shuffle=True) reshuffles on every fresh epoch, matching
-        # the previous data_stack's sample-without-replacement-per-epoch behavior.
+        # Pick up to batch_size random data points (background-prefetched when
+        # num_workers>0); DataLoader(shuffle=True) reshuffles on every fresh
+        # epoch, matching the previous data_stack's sample-without-replacement-
+        # per-epoch behavior.
         if not data_buffer:
             try:
                 data_buffer = list(next(train_iter))
             except StopIteration:
                 train_iter = iter(train_loader)
                 data_buffer = list(next(train_iter))
-        raw = data_buffer.pop(randint(0, len(data_buffer)-1))
-        data = scene.train_dataset.build_camera(raw)
+        n_take = min(batch_size, len(data_buffer))
+        raws = [data_buffer.pop(randint(0, len(data_buffer) - 1)) for _ in range(n_take)]
+        cams = [scene.train_dataset.build_camera(raw) for raw in raws]
 
         # Render
         if (iteration - 1) == debug_from:
@@ -136,56 +138,95 @@ def training(config: DictConfig) -> None:
 
         lambda_mask = retrieve_scheduled_value(iteration, config.opt.lambda_mask)
         use_mask = lambda_mask > 0.
-        render_pkg = render(data, iteration, scene, pipe, background, compute_loss=True, return_opacity=use_mask)
 
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        opacity = render_pkg["opacity_render"] if use_mask else None
+        # NOTE: multi-stream concurrent rendering was tried here (each view on
+        # its own torch.cuda.Stream) and reverted -- diff_gaussian_rasterization
+        # holds internal scratch-buffer state that isn't safe across concurrent
+        # streams: it reproducibly returned NaN gradients from
+        # _RasterizeGaussiansBackward as soon as two views' forward passes
+        # overlapped (confirmed with detect_anomaly=true, independent of
+        # num_workers). Views are therefore rendered sequentially on the
+        # default stream; the real gain here is the multi-view loss batching
+        # below (one combined backward+optimizer step per `batch_size` views)
+        # rather than concurrent GPU execution.
+        render_pkgs = [
+            render(cam, iteration, scene, pipe, background, compute_loss=True, return_opacity=use_mask)
+            for cam in cams
+        ]
 
-        # Loss
-        gt_image = data.original_image.cuda()
-
+        # Loss (averaged over the batch of views rendered above)
         lambda_l1 = retrieve_scheduled_value(iteration, config.opt.lambda_l1)
         lambda_dssim = retrieve_scheduled_value(iteration, config.opt.lambda_dssim)
-        loss_l1 = torch.tensor(0.).cuda()
-        loss_dssim = torch.tensor(0.).cuda()
-        if lambda_l1 > 0.:
-            loss_l1 = l1_loss(image, gt_image)
-        if lambda_dssim > 0.:
-            loss_dssim = 1.0 - ssim(image, gt_image)
-        loss = lambda_l1 * loss_l1 + lambda_dssim * loss_dssim
-
-        # perceptual loss
         lambda_perceptual = retrieve_scheduled_value(iteration, config.opt.lambda_perceptual)
-        if lambda_perceptual > 0:
-            # crop the foreground
-            mask = data.original_mask.cpu().numpy()
-            mask_idx = np.where(mask)
-            y1, y2 = mask_idx[1].min(), mask_idx[1].max() + 1
-            x1, x2 = mask_idx[2].min(), mask_idx[2].max() + 1
-            fg_image = image[:, y1:y2, x1:x2]
-            gt_fg_image = gt_image[:, y1:y2, x1:x2]
+        lambda_aiap_xyz = retrieve_scheduled_value(iteration, config.opt.lambda_aiap_xyz)
+        lambda_aiap_cov = retrieve_scheduled_value(iteration, config.opt.lambda_aiap_cov)
 
-            loss_perceptual = loss_fn_vgg(fg_image, gt_fg_image, normalize=True).mean()
-            loss += lambda_perceptual * loss_perceptual
-        else:
-            loss_perceptual = torch.tensor(0.)
+        loss_l1 = torch.zeros((), device="cuda")
+        loss_dssim = torch.zeros((), device="cuda")
+        loss_perceptual = torch.zeros((), device="cuda")
+        loss_mask = torch.zeros((), device="cuda")
+        loss_aiap_xyz = torch.zeros((), device="cuda")
+        loss_aiap_cov = torch.zeros((), device="cuda")
+        loss_reg_sums: dict[str, torch.Tensor] = {}
 
-        # mask loss
-        gt_mask = data.original_mask.cuda()
-        if not use_mask:
-            loss_mask = torch.tensor(0.).cuda()
-        elif config.opt.mask_loss_type == 'bce':
-            assert opacity is not None
-            opacity = torch.clamp(opacity, MASK_LOSS_BCE_EPS, 1.-MASK_LOSS_BCE_EPS)
-            loss_mask = F.binary_cross_entropy(opacity, gt_mask)
-        elif config.opt.mask_loss_type == 'l1':
-            assert opacity is not None
-            loss_mask = F.l1_loss(opacity, gt_mask)
-        else:
-            raise ValueError
+        viewspace_point_tensors, visibility_filters, radii_list = [], [], []
+        for cam, render_pkg in zip(cams, render_pkgs):
+            image = render_pkg["render"]
+            viewspace_point_tensors.append(render_pkg["viewspace_points"])
+            visibility_filters.append(render_pkg["visibility_filter"])
+            radii_list.append(render_pkg["radii"])
+            opacity = render_pkg["opacity_render"] if use_mask else None
+
+            gt_image = cam.original_image.cuda()
+
+            if lambda_l1 > 0.:
+                loss_l1 = loss_l1 + l1_loss(image, gt_image)
+            if lambda_dssim > 0.:
+                loss_dssim = loss_dssim + (1.0 - ssim(image, gt_image))
+
+            if lambda_perceptual > 0:
+                # crop the foreground
+                mask = cam.original_mask.cpu().numpy()
+                mask_idx = np.where(mask)
+                y1, y2 = mask_idx[1].min(), mask_idx[1].max() + 1
+                x1, x2 = mask_idx[2].min(), mask_idx[2].max() + 1
+                fg_image = image[:, y1:y2, x1:x2]
+                gt_fg_image = gt_image[:, y1:y2, x1:x2]
+                loss_perceptual = loss_perceptual + loss_fn_vgg(fg_image, gt_fg_image, normalize=True).mean()
+
+            gt_mask = cam.original_mask.cuda()
+            if use_mask:
+                assert opacity is not None
+                if config.opt.mask_loss_type == 'bce':
+                    opacity_c = torch.clamp(opacity, MASK_LOSS_BCE_EPS, 1. - MASK_LOSS_BCE_EPS)
+                    loss_mask = loss_mask + F.binary_cross_entropy(opacity_c, gt_mask)
+                elif config.opt.mask_loss_type == 'l1':
+                    loss_mask = loss_mask + F.l1_loss(opacity, gt_mask)
+                else:
+                    raise ValueError
+
+            if lambda_aiap_xyz > 0. or lambda_aiap_cov > 0.:
+                aiap = full_aiap_loss(scene.gaussians, render_pkg["deformed_gaussian"])
+                loss_aiap_xyz = loss_aiap_xyz + aiap.xyz
+                loss_aiap_cov = loss_aiap_cov + aiap.covariance
+
+            for name, value in render_pkg["loss_reg"].items():
+                loss_reg_sums[name] = loss_reg_sums.get(name, torch.zeros((), device="cuda")) + value
+
+        n_views = len(cams)
+        loss_l1 = loss_l1 / n_views
+        loss_dssim = loss_dssim / n_views
+        loss_perceptual = loss_perceptual / n_views
+        loss_mask = loss_mask / n_views
+        loss_aiap_xyz = loss_aiap_xyz / n_views
+        loss_aiap_cov = loss_aiap_cov / n_views
+        loss_reg = {name: value / n_views for name, value in loss_reg_sums.items()}
+
+        loss = lambda_l1 * loss_l1 + lambda_dssim * loss_dssim
+        loss += lambda_perceptual * loss_perceptual
         loss += lambda_mask * loss_mask
 
-        # skinning loss
+        # skinning loss (pose-independent regularization on the shared deformer, not per-view)
         lambda_skinning = retrieve_scheduled_value(iteration, config.opt.lambda_skinning)
         if lambda_skinning > 0:
             loss_skinning = scene.get_skinning_loss()
@@ -193,19 +234,10 @@ def training(config: DictConfig) -> None:
         else:
             loss_skinning = torch.tensor(0.).cuda()
 
-        lambda_aiap_xyz = retrieve_scheduled_value(iteration, config.opt.lambda_aiap_xyz)
-        lambda_aiap_cov = retrieve_scheduled_value(iteration, config.opt.lambda_aiap_cov)
-        if lambda_aiap_xyz > 0. or lambda_aiap_cov > 0.:
-            aiap = full_aiap_loss(scene.gaussians, render_pkg["deformed_gaussian"])
-            loss_aiap_xyz, loss_aiap_cov = aiap.xyz, aiap.covariance
-        else:
-            loss_aiap_xyz = torch.tensor(0.).cuda()
-            loss_aiap_cov = torch.tensor(0.).cuda()
         loss += lambda_aiap_xyz * loss_aiap_xyz
         loss += lambda_aiap_cov * loss_aiap_cov
 
         # regularization
-        loss_reg = render_pkg["loss_reg"]
         for name, value in loss_reg.items():
             lbd = opt[f"lambda_{name}"]
             lbd = retrieve_scheduled_value(iteration, lbd)
@@ -250,8 +282,9 @@ def training(config: DictConfig) -> None:
             # Densification
             if iteration < opt.densify_until_iter and iteration > model.gaussian.delay:
                 # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                for vp, vf, rad in zip(viewspace_point_tensors, visibility_filters, radii_list):
+                    gaussians.max_radii2D[vf] = torch.max(gaussians.max_radii2D[vf], rad[vf])
+                    gaussians.add_densification_stats(vp, vf)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = opt.densify_screen_size_threshold if iteration > opt.opacity_reset_interval else None
@@ -266,6 +299,12 @@ def training(config: DictConfig) -> None:
 
             if iteration in checkpoint_iterations:
                 scene.save_checkpoint(iteration)
+
+    # Always export a final point cloud PLY, even if opt.iterations wasn't
+    # in save_iterations (e.g. configs/option/no_val.yaml sets it to []).
+    if opt.iterations not in saving_iterations:
+        print("\n[ITER {}] Saving Gaussians".format(opt.iterations))
+        scene.save(opt.iterations)
 
 
 class ValidationConfig(TypedDict):
