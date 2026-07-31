@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.constants import (
@@ -90,7 +91,20 @@ def training(config: DictConfig) -> None:
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    data_stack: list[int] = []
+    num_workers = int(dataset.get('num_workers', 0))
+    batch_size = int(dataset.get('batch_size', 1))
+    train_loader = DataLoader(
+        scene.train_dataset.raw_dataset(),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=list,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
+    )
+    train_iter = iter(train_loader)
+    data_buffer: list = []
+
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -104,11 +118,17 @@ def training(config: DictConfig) -> None:
         if iteration % opt.sh_degree_up_interval == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random data point
-        if not data_stack:
-            data_stack = list(range(len(scene.train_dataset)))
-        data_idx = data_stack.pop(randint(0, len(data_stack)-1))
-        data = scene.train_dataset[data_idx]
+        # Pick a random data point (background-prefetched when num_workers>0);
+        # DataLoader(shuffle=True) reshuffles on every fresh epoch, matching
+        # the previous data_stack's sample-without-replacement-per-epoch behavior.
+        if not data_buffer:
+            try:
+                data_buffer = list(next(train_iter))
+            except StopIteration:
+                train_iter = iter(train_loader)
+                data_buffer = list(next(train_iter))
+        raw = data_buffer.pop(randint(0, len(data_buffer)-1))
+        data = scene.train_dataset.build_camera(raw)
 
         # Render
         if (iteration - 1) == debug_from:

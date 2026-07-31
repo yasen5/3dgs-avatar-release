@@ -30,6 +30,15 @@ dataset:
   preload: true
   source_layout: prepared
 
+  # DataLoader parallelism for the train split (see scripts/train.py). 0 keeps
+  # loading in the main process (original behavior); >0 loads/prefetches in
+  # background worker subprocesses to overlap CPU image decode with GPU work.
+  # 2 captures the full observed speedup in sweeps (see PR/commit notes); more
+  # workers cost linearly more host RAM (each is a forked copy holding the
+  # precomputed per-frame pose tensors + mesh data) without further gains.
+  num_workers: 2
+  batch_size: 1
+
   mode: ${mode}
   test_mode: view
   predict_seq: 0

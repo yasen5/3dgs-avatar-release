@@ -84,6 +84,20 @@ class MHRMetadata(MHRCanonicalMetadata):
     is_keyframe: npt.NDArray[np.bool_]
 
 
+class RawFrame(TypedDict):
+    """CPU-only frame payload produced by MHRNativeDataset.load_raw -- the part
+    of a Camera that's safe to build inside a DataLoader worker subprocess
+    (see load_raw's docstring for why the rest of Camera construction isn't)."""
+    frame_id: str
+    K: npt.NDArray[np.floating[Any]]
+    FoVx: float
+    FoVy: float
+    image: torch.Tensor
+    mask: torch.Tensor
+    rots: torch.Tensor
+    bone_transforms: torch.Tensor
+
+
 class MHRNativeDataset(Dataset[Camera]):
     def __init__(self, cfg: DictConfig, split: str = 'train') -> None:
         super().__init__()
@@ -123,10 +137,66 @@ class MHRNativeDataset(Dataset[Camera]):
         self.metadata: MHRCanonicalMetadata | MHRMetadata
         self.get_metadata()
 
+        # Per-frame pose (joint rotations + bone transforms) only depends on
+        # shape/model params + cam_t, never on the image -- so it is computed
+        # once here as a single batched CUDA forward pass instead of once per
+        # __getitem__ call. This keeps __getitem__ CPU-only (cv2 image/mask
+        # decode + tensor bookkeeping), which is required for it to be safely
+        # farmed out to torch DataLoader worker subprocesses (num_workers>0);
+        # touching a CUDA model from a forked worker is unsupported.
+        self.pose_rot_all: torch.Tensor
+        self.bone_transforms_all: torch.Tensor
+        self._precompute_pose_data()
+
         self.preload: bool = cfg.preload
         self.cameras: list[Camera] = []
         if self.preload:
             self.cameras = [self.getitem(idx) for idx in range(len(self))]
+
+    def _precompute_pose_data(self) -> None:
+        """Batched replacement for the per-item mhr_query + joint_relative_transforms
+        calls: runs the MHR forward pass over all frames (chunked to bound GPU
+        memory) once, and stores the resulting per-frame pose_rot/bone_transforms
+        as CPU tensors for __getitem__ to index into."""
+        n = len(self.frame_ids)
+        shape_params_all = self.parms["shape_params"].float()
+        model_params_all = self.parms["model_params"].float()
+        cam_t_all = self.parms["cam_t"].float()
+
+        big_pose_joint_pos = self.metadata["big_pose_joint_pos"]  # (127,3)
+        big_pose_joint_rotmat = self.metadata["big_pose_joint_rotmat"]  # (127,3,3)
+
+        chunk_size = 256
+        pose_rot_chunks: list[torch.Tensor] = []
+        bone_transforms_chunks: list[torch.Tensor] = []
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            b = end - start
+            with torch.no_grad():
+                out = mhr_lbs.mhr_query(
+                    self.mhr_model,
+                    shape_params_all[start:end].to(self.device),
+                    model_params_all[start:end].to(self.device),
+                    device=self.device,
+                )
+            joint_pos = out["joint_pos"].cpu()  # (b,127,3)
+            joint_rotmat = out["joint_rotmat"].cpu()  # (b,127,3,3)
+
+            pose_rot = local_joint_rotmats(joint_rotmat, self.joint_parents)
+            pose_rot = pose_rot.reshape(b, -1, 9)  # (b,127,9)
+
+            rest_pos = big_pose_joint_pos.unsqueeze(0).expand(b, -1, -1)
+            rest_rotmat = big_pose_joint_rotmat.unsqueeze(0).expand(b, -1, -1, -1)
+            bone_transforms = mhr_lbs.joint_relative_transforms(
+                joint_pos, joint_rotmat, rest_pos, rest_rotmat,
+            )  # (b,127,4,4)
+            bone_transforms[:, :, :3, 3] += cam_t_all[start:end].unsqueeze(1)
+
+            pose_rot_chunks.append(pose_rot)
+            bone_transforms_chunks.append(bone_transforms)
+
+        self.pose_rot_all = torch.cat(pose_rot_chunks, dim=0).float()
+        self.bone_transforms_all = torch.cat(bone_transforms_chunks, dim=0).float()
 
     def _load_prepared_source(self) -> None:
         """Load the native train/test directory layout."""
@@ -350,7 +420,11 @@ class MHRNativeDataset(Dataset[Camera]):
     def __len__(self) -> int:
         return len(self.frame_ids)
 
-    def getitem(self, idx: int) -> Camera:
+    def load_raw(self, idx: int) -> RawFrame:
+        """CPU-only frame load (disk I/O + tensor bookkeeping, no CUDA). Safe to
+        call from DataLoader worker subprocesses -- unlike building a Camera
+        directly, which internally moves tensors to cfg.data_device (typically
+        'cuda') and therefore must happen in the main process; see build_camera."""
         frame_id = self.frame_ids[idx]
         img_path = self._image_paths[frame_id]
         valid_path = self._mask_paths[frame_id]
@@ -377,48 +451,49 @@ class MHRNativeDataset(Dataset[Camera]):
         FoVy = focal2fov(focal, height)
         K = np.array([[focal, 0, width / 2.0], [0, focal, height / 2.0], [0, 0, 1]], dtype=np.float32)
 
-        shape_params = self.parms["shape_params"][idx:idx + 1].to(self.device)
-        model_params = self.parms["model_params"][idx:idx + 1].to(self.device)
-        cam_t = self.parms["cam_t"][idx].to(self.device)
+        pose_rot = self.pose_rot_all[idx]  # (127,9)
+        bone_transforms = self.bone_transforms_all[idx]  # (127,4,4)
 
-        with torch.no_grad():
-            out = mhr_lbs.mhr_query(self.mhr_model, shape_params, model_params, device=self.device)
-        joint_pos = out["joint_pos"][0].cpu()  # (127,3), canonical/rest-relative (no cam_t)
-        joint_rotmat = out["joint_rotmat"][0].cpu()  # (127,3,3)
-
-        pose_rot = local_joint_rotmats(joint_rotmat.unsqueeze(0), self.joint_parents)[0]
-        pose_rot = pose_rot.reshape(-1, 9)  # (127,9)
-
-        # cano_data (both the train and non-train metadata branches include it,
-        # see get_metadata) always has these two fields.
-        big_pose_joint_pos = self.metadata['big_pose_joint_pos']
-        big_pose_joint_rotmat = self.metadata['big_pose_joint_rotmat']
-
-        bone_transforms = mhr_lbs.joint_relative_transforms(
-            joint_pos.unsqueeze(0), joint_rotmat.unsqueeze(0),
-            big_pose_joint_pos.unsqueeze(0), big_pose_joint_rotmat.unsqueeze(0),
-        )[0]  # (127,4,4)
-        bone_transforms[:, :3, 3] += cam_t.cpu()
-
-        return Camera(
+        return RawFrame(
             frame_id=frame_id,
-            cam_id=0,
-            K=K, R=np.eye(3, dtype=np.float32), T=np.zeros(3, dtype=np.float32),
+            K=K,
             FoVx=FoVx, FoVy=FoVy,
             image=image_t,
             mask=mask_t,
-            gt_alpha_mask=None,
-            image_name=frame_id,
-            data_device=self.cfg.data_device,
             rots=pose_rot.float().unsqueeze(0),
-            Jtrs=self.metadata['jtr_norm'].unsqueeze(0),
-            bone_transforms=bone_transforms.float(),
+            bone_transforms=bone_transforms.clone(),
         )
+
+    def build_camera(self, raw: RawFrame) -> Camera:
+        """Turn a load_raw() result into a Camera, including the CUDA moves --
+        must run in the main process (see load_raw's docstring)."""
+        return Camera(
+            frame_id=raw['frame_id'],
+            cam_id=0,
+            K=raw['K'], R=np.eye(3, dtype=np.float32), T=np.zeros(3, dtype=np.float32),
+            FoVx=raw['FoVx'], FoVy=raw['FoVy'],
+            image=raw['image'],
+            mask=raw['mask'],
+            gt_alpha_mask=None,
+            image_name=raw['frame_id'],
+            data_device=self.cfg.data_device,
+            rots=raw['rots'],
+            Jtrs=self.metadata['jtr_norm'].unsqueeze(0),
+            bone_transforms=raw['bone_transforms'].float(),
+        )
+
+    def getitem(self, idx: int) -> Camera:
+        return self.build_camera(self.load_raw(idx))
 
     def __getitem__(self, idx: int) -> Camera:
         if self.preload:
             return self.cameras[idx]
         return self.getitem(idx)
+
+    def raw_dataset(self) -> RawFrameDataset:
+        """A CPU-only view of this dataset (load_raw instead of build_camera),
+        suitable for a torch DataLoader with num_workers>0 -- see load_raw."""
+        return RawFrameDataset(self)
 
     def readPointCloud(self) -> BasicPointCloud:
         ply_path = os.path.join(self.root_dir, 'cano_mhr.ply')
@@ -434,3 +509,19 @@ class MHRNativeDataset(Dataset[Camera]):
             storePly(ply_path, xyz, rgb)
             pcd = fetchPly(ply_path)
         return pcd
+
+
+class RawFrameDataset(Dataset[RawFrame]):
+    """CPU-only Dataset wrapper for MHRNativeDataset, for use with a torch
+    DataLoader(num_workers>0): each worker only ever touches load_raw (disk
+    I/O + CPU tensor ops), never build_camera (which does the CUDA moves and
+    so must stay in the main process)."""
+
+    def __init__(self, dataset: MHRNativeDataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> RawFrame:
+        return self.dataset.load_raw(idx)
