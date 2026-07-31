@@ -15,6 +15,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 REPO = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, REPO)
+import src.scene  # noqa: E402  (side-effect import breaks a circular-import ordering issue)
 from src.dataset.mhr_native import MHRNativeDataset  # noqa: E402
 
 with initialize_config_dir(version_base=None, config_dir=f"{REPO}/configs"):

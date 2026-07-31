@@ -14,19 +14,39 @@ import torch
 
 # Empirically-found "big pose" (SMPL star/Vitruvian-pose analogue) dims in MHR's
 # 204-dim model_params vector: global_trans(3) + global_rot(3) + body_pose(198),
-# so +6 offsets into body_pose. shoulder pair (45,54), hip pair (24,34), delta 0.6 --
-# found by finite-differencing which body_pose dims abduct the shoulders/hips: not
-# derivable from the rig itself, must be reused as-is.
-BIG_POSE_SHOULDER_DIMS = [45, 54]
-BIG_POSE_HIP_DIMS = [24, 34]
+# so +6 offsets into body_pose, delta 0.6 -- found by finite-differencing which
+# body_pose dims move which joint chains: not derivable from the rig itself,
+# must be reused as-is.
+#
+# Identified by joint hierarchy, not by these dims' old (wrong) names: dims
+# (24,34) move the chain rooted at joints 38/74, whose root sits at shoulder
+# height (right beside the head joint) and terminates in a 5-digit hand --
+# these are the ARM dims. Dims (45,54) move the chain rooted at joints 18/2,
+# whose root sits exactly at pelvis height -- these are the LEG dims. (A prior
+# version of this file had the two pairs swapped/named backwards, which is how
+# a real bug in the leg dims went unnoticed while the arm dims got "fixed"
+# instead.)
+#
+# Both pairs need -BIG_POSE_DELTA, not +, to abduct outward without crossing
+# the midline. +BIG_POSE_DELTA on the leg dims is severe enough that each
+# foot joint ends up on the OPPOSITE side of the body from its own hip root
+# (e.g. left hip root at x=-0.078 swings to a foot at x=+0.287) -- a genuine
+# kinematic crossing, not just a tight stance -- which is what actually
+# produced the cross-legged canonical pose. -BIG_POSE_DELTA keeps each leg's
+# whole chain on its own side (verified with fcl: zero triangle-triangle
+# collision between the left/right leg surfaces, 0/3579 vertices cross
+# sides, ~7.7cm minimum surface gap) while abducting into a clean
+# star/Vitruvian pose.
+BIG_POSE_ARM_DIMS = [24, 34]
+BIG_POSE_LEG_DIMS = [45, 54]
 BIG_POSE_DELTA = 0.6
 
 
 def build_big_pose_model_params(reference_model_params: torch.Tensor) -> torch.Tensor:
     mp = reference_model_params.clone()
     mp[:136] = 0.0
-    for dim in BIG_POSE_SHOULDER_DIMS + BIG_POSE_HIP_DIMS:
-        mp[6 + dim] = BIG_POSE_DELTA
+    for dim in BIG_POSE_ARM_DIMS + BIG_POSE_LEG_DIMS:
+        mp[6 + dim] = -BIG_POSE_DELTA
     return mp
 
 
