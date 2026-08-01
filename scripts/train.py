@@ -105,6 +105,10 @@ def training(config: DictConfig) -> None:
     train_iter = iter(train_loader)
     data_buffer: list = []
 
+    if 0 in saving_iterations:
+        print("\n[ITER 0] Saving Gaussians")
+        scene.save(0)
+
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
