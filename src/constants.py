@@ -48,6 +48,28 @@ BIG_POSE_ARM_DIMS = [24, 34]
 BIG_POSE_LEG_DIMS = [45, 54]
 BIG_POSE_DELTA = 0.6
 
+# --- MHR hand DOFs (see scripts/refine_hands_rtmpose.py for the derivation) -------------------
+# `mhr_param_hand_idxs` from third_party/mesh_recovery/sam3d-body-original's own
+# sam_3d_body/models/modules/mhr_utils.py -- offsets (+BODY_POSE_OFFSET, same convention as
+# BIG_POSE_ARM_DIMS/BIG_POSE_LEG_DIMS above) into model_params' body_pose block for the 54 hand
+# DOFs (27 per hand: 1 wrist + 5 fingers x 4, in per-joint XYZ-euler-ish order), verified by
+# diffing a real fit's mhr_model_params[BODY_POSE_OFFSET:BODY_POSE_OFFSET+133] against its own
+# body_pose_params array: they agree everywhere except exactly these 54 indices.
+MHR_HAND_DIMS = [
+    62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
+    85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
+    106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+]
+
+# MHR joint indices (into mhr_lbs.mhr_query's 127-joint output) for each hand's 21-keypoint
+# wrist->finger chain, in standard wrist-first order (0=wrist,1-4=thumb,...,17-20=pinky) --
+# found by walking joint_parents from the wrist down each of the 5 finger chains and confirmed
+# to exact sub-mm/sub-pixel agreement against a saved fit's own pred_keypoints_3d/2d. This is
+# also rtmlib's native (to_openpose=False) hand21 keypoint order, so RTMPose output maps to
+# these joints index-for-index with no relabeling.
+MHR_HAND_A_JOINTS = [41, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 61, 62, 63, 64]
+MHR_HAND_B_JOINTS = [j + 36 for j in MHR_HAND_A_JOINTS]
+
 # --- Dataset / scene-scale constants -----------------------------------------
 # Scene-scale constant for this data's camera rig (verified to work well at
 # this data scale) -- not a per-camera-rig quantity, so it's fixed here rather
