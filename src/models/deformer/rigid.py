@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig
+from pytorch3d.ops import knn_points
 
 from src.dataset.mhr_native import MHRMetadata
 from src.models.network_utils import get_skinning_mlp
@@ -53,6 +54,12 @@ class SkinningField(RigidDeform):
         self.lbs_network = get_skinning_mlp(3, cfg.d_out, cfg.skinning_network)
         self.lbs_voxel_final: torch.Tensor
 
+        self.cano_verts_norm: torch.Tensor
+        self.skinning_weights_t: torch.Tensor
+        cano_verts_t = torch.from_numpy(self.cano_verts).float()
+        self.register_buffer("cano_verts_norm", self.aabb.normalize(cano_verts_t, sym=True))
+        self.register_buffer("skinning_weights_t", torch.from_numpy(self.skinning_weights).float())
+
 
     def precompute(self, recompute_skinning: bool = True) -> None:
         if recompute_skinning or not hasattr(self, "lbs_voxel_final"):
@@ -65,6 +72,19 @@ class SkinningField(RigidDeform):
 
             self.lbs_voxel_final = lbs_voxel_final.permute(1, 0).reshape(1, self.n_joints, d, h, w)
 
+    def predict_skinning_weights(self, xyz_norm: torch.Tensor) -> torch.Tensor:
+        """3DGA-style skinning weights: an MLP predicts a logit-space offset on
+        top of a default skinning weight looked up from the nearest canonical
+        mesh vertex (Eq. 7 in 3dga_paper.txt), instead of predicting the full
+        weight distribution from scratch. The nearest-neighbor lookup is
+        non-differentiable; only the offset MLP receives gradient."""
+        with torch.no_grad():
+            _, idx, _ = knn_points(xyz_norm[None], self.cano_verts_norm[None], K=1)
+        default_w = self.skinning_weights_t[idx.view(-1)]
+        offset_logits = self.lbs_network(xyz_norm)
+        pts_W = self.softmax(torch.log(default_w + 1e-9) + offset_logits)
+        return pts_W
+
     def get_forward_transform(self, xyz: torch.Tensor, tfs: torch.Tensor) -> torch.Tensor:
         if self.distill:
             self.precompute(recompute_skinning=self.training)
@@ -73,8 +93,7 @@ class SkinningField(RigidDeform):
             T_fwd = F.grid_sample(fwd_grid, xyz.reshape(1, 1, 1, -1, 3), padding_mode='border')
             T_fwd = T_fwd.reshape(4, 4, -1).permute(2, 0, 1)
         else:
-            pts_W = self.lbs_network(xyz)
-            pts_W = self.softmax(pts_W)
+            pts_W = self.predict_skinning_weights(xyz)
             T_fwd = torch.matmul(pts_W, tfs.view(-1, 16)).view(-1, 4, 4).float()
         return T_fwd
 
@@ -105,8 +124,7 @@ class SkinningField(RigidDeform):
             pred_weights = F.grid_sample(self.lbs_voxel_final, pts_skinning.reshape(1, 1, 1, -1, 3), padding_mode='border')
             pred_weights = pred_weights.reshape(self.n_joints, -1).permute(1, 0)
         else:
-            pred_weights = self.lbs_network(pts_skinning)
-            pred_weights = self.softmax(pred_weights)
+            pred_weights = self.predict_skinning_weights(pts_skinning)
         skinning_loss = torch.nn.functional.mse_loss(
             pred_weights, sampled_weights, reduction='none').sum(-1).mean()
         # breakpoint()
