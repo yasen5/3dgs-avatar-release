@@ -144,14 +144,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--point-radius",
         type=int,
-        default=1,
-        help="Projected vertex radius in pixels (default: 1).",
+        default=4,
+        help="Projected vertex radius in pixels (default: 4; single-pixel dots are hard to see on full-res frames).",
     )
     parser.add_argument(
         "--overlay-alpha",
         type=float,
-        default=0.9,
-        help="MHR mesh-point opacity over the source image (default: 0.9).",
+        default=1.0,
+        help="MHR mesh-point opacity over the source image (default: 1.0, fully opaque).",
     )
     parser.add_argument(
         "--panel-scale",
