@@ -111,6 +111,7 @@ class MHRNativeDataset(Dataset[Camera]):
         self.frame_ids: list[str] = []
         self._image_paths: dict[str, str] = {}
         self._mask_paths: dict[str, str] = {}
+        self._depth_dir: str = ""
         self.camera_names: list[str] = []
         self.is_keyframe: npt.NDArray[np.bool_] = np.zeros(0, dtype=bool)
         self.parms: MHRParms
@@ -152,6 +153,8 @@ class MHRNativeDataset(Dataset[Camera]):
         self.cameras: list[Camera] = []
         if self.preload:
             self.cameras = [self.getitem(idx) for idx in range(len(self))]
+
+        self._depth_dir = os.path.join(self.data_dir, "sapiens_depth")
 
     def _precompute_pose_data(self) -> None:
         """Batched replacement for the per-item mhr_query + joint_relative_transforms
@@ -507,6 +510,21 @@ class MHRNativeDataset(Dataset[Camera]):
         """A CPU-only view of this dataset (load_raw instead of build_camera),
         suitable for a torch DataLoader with num_workers>0 -- see load_raw."""
         return RawFrameDataset(self)
+
+    def load_depth_map(self, frame_id: str) -> torch.Tensor | None:
+        """Load a GA-Avatar/Sapiens depth map as ``(1,H,W)``.
+
+        The preprocessing script writes full-resolution ``float32`` arrays to
+        ``sapiens_depth/<frame>.npy``.  Missing supervision remains optional,
+        matching the SMPL-X dataset reader's behavior.
+        """
+        path = os.path.join(self._depth_dir, f"{frame_id}.npy")
+        if not os.path.isfile(path):
+            return None
+        depth = np.load(path).astype(np.float32)
+        if depth.ndim != 2:
+            raise ValueError(f"Expected a 2-D depth map at {path}, got {depth.shape}")
+        return torch.from_numpy(depth).unsqueeze(0).float()
 
     def readPointCloud(self) -> BasicPointCloud:
         ply_path = os.path.join(self.root_dir, 'cano_mhr.ply')
