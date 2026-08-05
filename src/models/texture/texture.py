@@ -134,10 +134,84 @@ class ColorMLP(ColorPrecompute):
         return color
 
 
+class GAAvatarRGB(ColorPrecompute):
+    """GA-Avatar's RGBNet: a base MLP(F_tri) -> static color logit c_f and a
+    pose-conditioned refine MLP(F_tri, theta) -> pose-dependent color logit
+    offset delta_c_p; c = (tanh(c_f + delta_c_p) + 1) / 2 -- see `forward`'s
+    comment for why the activation is applied once, at the end, rather than
+    to c_f alone, and why tanh (ExAvatar's convention) rather than sigmoid.
+    Shares the same `metadata['triplane']` TriplaneEncoder instance as
+    GAAvatarGeo (see GaussianConverter.__init__), matching the paper's single
+    shared F_tri feeding both branches."""
+
+    def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
+        super().__init__(cfg, metadata)
+        # List-wrapped: `triplane` is a real submodule of GaussianConverter
+        # (its own parameter/optimizer group lives there); GAAvatarRGB just
+        # borrows the same instance to read from -- see GAAvatarGeo's
+        # identical pattern for why this must not be a plain nn.Module attr.
+        self._triplane: list[object] = [metadata["triplane"]]
+        d_feat = self.triplane.n_output_dims
+        d_pose = int(cfg.pose_dim)
+        self.base_mlp = VanillaCondMLP(d_feat, 0, RGB_DIM, cfg.mlp_base)
+        self.refine_mlp = VanillaCondMLP(d_feat, d_pose, RGB_DIM, cfg.mlp_refine)
+
+    @property
+    def triplane(self):  # type: ignore[no-untyped-def]
+        return self._triplane[0]
+
+    def forward(self, gaussians: GaussianModel, camera: Camera) -> torch.Tensor:
+        # `gaussians.get_xyz` has already been posed to world space by
+        # VertexLBS (rigid runs after non-rigid in Deformer.forward, see
+        # deformer.py) by the time this runs -- normalizing THAT by the
+        # canonical-mesh AABB would put every query far outside [-1,1],
+        # which Triplane's grid_sample(padding_mode="border") clamps to a
+        # near-constant per-frame value, killing gradient into RGBNet
+        # (confirmed empirically: v4's RGBNet weights were bit-identical
+        # from iteration 2000 through 12000 despite the last_layer_init fix).
+        # `canonical_xyz` is GAAvatarGeo's live mu_bar + offsets, stashed
+        # before VertexLBS overwrote `_xyz` -- the same quantity GeoNet
+        # itself queries the triplane at, matching the paper's single
+        # shared F_tri per canonical vertex.
+        assert gaussians.canonical_xyz is not None, (
+            "GAAvatarRGB requires a non-rigid deformer (e.g. ga_avatar_geo) "
+            "that populates gaussians.canonical_xyz before rigid posing"
+        )
+        xyz_norm = self.metadata["aabb"].normalize(gaussians.canonical_xyz, sym=True)
+        f_tri = self.triplane(xyz_norm)
+
+        # Both branches stay in unconstrained logit space, combined additively,
+        # with a single activation applied at the very end -- mirrors GeoNet's
+        # scale output (s_f + delta_s_p, safe under its downstream exp()).
+        # The previous clamp(sigmoid(c_f) + delta_c_p, 0, 1) applied sigmoid to
+        # c_f BEFORE adding delta_c_p, then hard-clamped the sum: torch.clamp
+        # has exactly-zero gradient for any excursion outside [0,1], and
+        # confirmed empirically (v5, 2026-08-04) delta_c_p converges strongly
+        # negative within the first few hundred iterations regardless of
+        # last_layer_init, pushing c_f+delta_c_p negative for 100% of
+        # Gaussian/channel pairs -- an irreversible, permanent gradient-zero
+        # collapse. A smooth activation (never exactly zero gradient for
+        # finite inputs) applied once at the end avoids that specific failure
+        # mode.
+        #
+        # tanh (mapped to [0,1] via (tanh(x)+1)/2), not sigmoid: the paper
+        # doesn't specify which; ExAvatar_RELEASE (common/nets/module.py's
+        # HumanGaussian.forward) -- the closest available reference
+        # implementation for this triplane-conditioned dual-branch avatar
+        # architecture -- uses tanh, so we match that convention here rather
+        # than guessing independently.
+        c_f_logit = self.base_mlp(f_tri)
+        delta_c_p = self.refine_mlp(f_tri, cond=camera.rots)
+
+        color: torch.Tensor = (torch.tanh(c_f_logit + delta_c_p) + 1.0) / 2.0
+        return color
+
+
 def get_texture(cfg: DictConfig, metadata: MHRMetadata) -> ColorPrecompute:
     name = cfg.name
     model_dict = {
         "sh2rgb": SH2RGB,
         "mlp": ColorMLP,  # paper default (via the "shallow_mlp" config preset)
+        "ga_avatar_rgb": GAAvatarRGB,  # GA-Avatar: triplane-conditioned dual-branch appearance
     }
     return model_dict[name](cfg, metadata)

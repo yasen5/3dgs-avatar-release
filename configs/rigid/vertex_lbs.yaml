@@ -1,0 +1,14 @@
+# @package _global_
+# GA-Avatar's exact-vertex LBS rigid deformer (src/models/deformer/rigid.py's
+# VertexLBS): one Gaussian per canonical mesh vertex, so the skinning weight
+# is a direct per-vertex lookup -- no learned skinning field, no parameters.
+
+rigid_name: vertex_lbs
+
+model:
+  deformer:
+    rigid:
+      name: vertex_lbs
+
+opt:
+  rigid_lr: 0.0

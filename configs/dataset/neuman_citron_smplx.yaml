@@ -1,0 +1,40 @@
+# @package _global_
+
+dataset_name: neuman_citron_smplx
+
+dataset:
+  name: neuman_smplx
+  root_dir: "/mnt/ssd2/exavatar_neuman_combined/data/citron"
+
+  preload: true
+  # Only 30 train frames, and CUDA is already initialized in the main
+  # process (GaussianModel/LPIPS) well before scripts/train.py's DataLoader
+  # is built -- forking worker subprocesses after that is unsafe ("CUDA
+  # error: initialization error"). MHR configs get away with num_workers>0
+  # because load_raw there is carefully CPU-only; not worth replicating that
+  # care for a 30-frame dataset.
+  num_workers: 0
+  # 1276x717 source resolution + a 167K-vertex canonical mesh needs ~20GB of
+  # diff_gaussian_rasterization scratch buffers at full res -- more than fits
+  # on hardware smaller than the paper's RTX 4090 (24GB). See
+  # NeumanSMPLXDataset.load_raw's comment; not a change to Gaussian
+  # count/topology, only render resolution.
+  # downsample=2 fit an isolated forward+backward color pass (~9.3GB) but
+  # not full training (LPIPS forward+backward + optimizer state on top pushed
+  # past 11.6GB) -- see the ga_avatar_logs debugging history. 3 leaves
+  # meaningfully more headroom.
+  downsample: 3
+  padding: 0.1
+  canonical_norm_padding: 0.05
+  jtr_norm_scale: 1.1
+  resolution: -1
+  white_background: false
+  data_device: cuda
+  eval: true
+
+  body_model:
+    name: smplx
+    model_path: /mnt/ssd2/smplx
+    gender: neutral
+    num_betas: 10
+    n_subdivisions: 2

@@ -1,0 +1,67 @@
+from typing import Any
+
+import numpy as np
+import numpy.typing as npt
+import torch
+import trimesh
+
+from src.body_models.base import BodyModel
+
+
+class _ToyBodyModel(BodyModel):
+    def __init__(self) -> None:
+        self._vertices = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        self._weights = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    def rest_vertices(self) -> torch.Tensor:
+        return self._vertices
+
+    def faces(self) -> npt.NDArray[np.integer[Any]]:
+        return np.array([[0, 1, 1]], dtype=np.int64)
+
+    def skinning_weights(self) -> torch.Tensor:
+        return self._weights
+
+    def joint_parents(self) -> npt.NDArray[np.integer[Any]]:
+        return np.array([0, 0], dtype=np.int64)
+
+    def pose_transforms(
+        self, pose_params: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if pose_params.ndim == 1:
+            pose_params = pose_params.unsqueeze(0)
+        batch_size = pose_params.shape[0]
+        transforms = torch.eye(4).repeat(batch_size, 2, 1, 1)
+        transforms[:, 1, 0, 3] = 2.0
+        joint_pos = transforms[:, :, :3, 3]
+        joint_rotmat = transforms[:, :, :3, :3]
+        return joint_pos, joint_rotmat, transforms
+
+    def subdivide(
+        self, mesh: trimesh.Trimesh, n_iters: int
+    ) -> tuple[trimesh.Trimesh, npt.NDArray[np.integer[Any]]]:
+        return mesh, np.arange(len(mesh.vertices), dtype=np.int64)
+
+    def face_region_mask(self) -> npt.NDArray[np.bool_]:
+        return np.zeros(2, dtype=bool)
+
+
+def test_lbs_uses_default_weights_and_returns_unbatched_vertices() -> None:
+    model = _ToyBodyModel()
+
+    posed = model.lbs(torch.zeros(1))
+
+    assert posed.shape == (2, 3)
+    assert torch.allclose(posed, torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]]))
+
+
+def test_lbs_accepts_custom_and_batched_weights() -> None:
+    model = _ToyBodyModel()
+    swapped = model.skinning_weights().flip(1)
+
+    posed = model.lbs(torch.zeros(2, 1), lbs_weights=swapped)
+
+    expected_one = torch.tensor([[2.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    assert posed.shape == (2, 2, 3)
+    assert torch.allclose(posed[0], expected_one)
+    assert torch.allclose(posed[1], expected_one)

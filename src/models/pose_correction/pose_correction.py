@@ -101,4 +101,10 @@ def get_pose_correction(cfg: DictConfig, metadata: MHRMetadata) -> nn.Module:
     model_dict = {
         "direct": DirectPoseOptimization,  # paper default
     }
+    if name not in model_dict:
+        # Lazy import: keeps this (MHR-only) module free of a `smplx`/BodyModel
+        # dependency unless a GA-Avatar pose_correction mode is actually requested.
+        from src.models.pose_correction.cto import get_pose_correction_extra
+
+        model_dict.update(get_pose_correction_extra())
     return model_dict[name](cfg, metadata)

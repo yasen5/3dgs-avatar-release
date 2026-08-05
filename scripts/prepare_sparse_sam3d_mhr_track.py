@@ -1,0 +1,1 @@
+../../../../pipelines/texture_appearance/videoavatars_baseline/prepare_sparse_sam3d_mhr_track.py

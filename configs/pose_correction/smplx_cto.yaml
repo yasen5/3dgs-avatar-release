@@ -1,0 +1,27 @@
+# @package _global_
+# GA-Avatar's Canonical Template Optimization (src/models/pose_correction/
+# cto.py's SMPLXTemplateOptimization): optimizes the SMPL-X body model's
+# {beta, joint_offset, face_offset}, NEVER per-frame pose theta (held fixed,
+# unlike DirectPoseOptimization's MHR model_params).
+
+pose_name: smplx_cto
+
+model:
+  pose_correction:
+    name: smplx_cto
+    delay: 0
+
+opt:
+  # The paper (Sec. V-C, Implementation Details) fixes the SMPL-X parameter
+  # group's LR at 0, excluding CTO {beta, joint_offset, face_offset} from
+  # joint optimization during the main avatar-training loop entirely ("to
+  # improve the accuracy and stability of the final reconstruction") --
+  # despite Sec. III-B describing CTO conceptually as updated during
+  # training. In practice this means CTO is fit/fixed separately and frozen
+  # for the run that produces their reported numbers; we rely on the
+  # ExAvatar-derived smplx_optimized/{joint_offset,face_offset}.json fit
+  # (already used as this module's delta_J_gt regularization target) as that
+  # fixed initialization instead of re-deriving it via photometric gradient
+  # descent, which the paper found unstable.
+  pose_correction_lr: 0.
+  lambda_joint: 1.0

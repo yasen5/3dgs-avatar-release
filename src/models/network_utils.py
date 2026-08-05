@@ -7,6 +7,7 @@ import numpy.typing as npt
 import tinycudann as tcnn
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from typing_extensions import TypeAlias
 
@@ -417,3 +418,57 @@ class HashGrid(nn.Module):
 
         out: torch.Tensor = self.encoding(x)
         return out
+
+
+class Triplane(nn.Module):
+    """GA-Avatar's triplane feature encoder: three learnable feature planes
+    (xy/xz/yz projections), each bilinearly sampled at a 3-D query position
+    and concatenated. Unlike `HashGrid` above (a 3-D hash grid, used only for
+    the MHR-era non-rigid deformer), this is a genuine 2-D-plane encoder, the
+    representation GA-Avatar's paper specifies for GeoNet/RGBNet's shared
+    input feature F_tri."""
+
+    def __init__(self, resolution: int, channels: int) -> None:
+        super().__init__()
+        self.resolution = resolution
+        self.channels = channels
+        self.n_output_dims = channels * 3
+        self.planes = nn.Parameter(torch.randn(3, channels, resolution, resolution) * 0.01)
+        # (xy, xz, yz) axis-pairs, one per plane
+        self._axis_pairs = ((0, 1), (0, 2), (1, 2))
+
+    def forward(self, xyz_norm: torch.Tensor) -> torch.Tensor:
+        """xyz_norm: (N,3) in [-1,1]^3 (e.g. via AABB.normalize(sym=True))."""
+        n = xyz_norm.shape[0]
+        feats = []
+        for i, (a, b) in enumerate(self._axis_pairs):
+            grid = xyz_norm[:, [a, b]].view(1, n, 1, 2)
+            plane = self.planes[i].unsqueeze(0)  # (1,C,H,W)
+            sampled = F.grid_sample(plane, grid, mode="bilinear", align_corners=True, padding_mode="border")
+            feats.append(sampled.view(self.channels, n).transpose(0, 1))  # (N,C)
+        return torch.cat(feats, dim=1)  # (N, 3*C)
+
+
+class TriplaneEncoder(nn.Module):
+    """Combines a body-resolution Triplane with a separate higher-resolution
+    face-region Triplane, selecting per-vertex via a fixed boolean face mask
+    -- GA-Avatar's F_tri. Built once (shared between GeoNet and RGBNet) in
+    GaussianConverter.__init__ and injected into `metadata['triplane']`
+    before the non_rigid/texture factories run, so both branches read the
+    same triplane parameters (matching the paper's single shared F_tri)."""
+
+    def __init__(self, body_cfg: DictConfig, face_cfg: DictConfig, face_mask: npt.NDArray[np.bool_]) -> None:
+        super().__init__()
+        self.body = Triplane(body_cfg.resolution, body_cfg.channels)
+        self.face = Triplane(face_cfg.resolution, face_cfg.channels)
+        assert self.body.n_output_dims == self.face.n_output_dims, (
+            "body/face triplanes must share a channel count so GeoNet/RGBNet see a fixed-width F_tri"
+        )
+        self.n_output_dims = self.body.n_output_dims
+        self.register_buffer("face_mask", torch.from_numpy(face_mask))
+
+    def forward(self, xyz_norm: torch.Tensor) -> torch.Tensor:
+        body_feat = self.body(xyz_norm)
+        face_feat = self.face(xyz_norm)
+        mask = self.face_mask.unsqueeze(-1).expand_as(body_feat)
+        return torch.where(mask, face_feat, body_feat)

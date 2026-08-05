@@ -162,9 +162,88 @@ class SkinningField(RigidDeform):
             'loss_skinning': loss_skinning
         }
 
+class VertexLBS(RigidDeform):
+    """GA-Avatar's rigid deformer: one Gaussian per canonical mesh vertex, so
+    each Gaussian's skinning weight is simply that vertex's own (subdivision-
+    propagated) row of the body model's dense skinning weights -- no learned
+    skinning field, no nearest-neighbor lookup (contrast with SkinningField
+    above, which is needed only when Gaussians are NOT 1:1 with mesh
+    vertices).
+
+    Per-frame bone transforms are recomputed live each forward() call from
+    `metadata['body_model']` (whose CTO parameters -- beta, joint_offset --
+    are being optimized) composed with the frame's fixed pose
+    (`camera.rots`) and world-alignment (`camera.align_matrix`), rather than
+    reusing `camera.bone_transforms`'s dataset-init-time snapshot, so that
+    gradients from the rendering loss reach joint_offset/beta through the
+    posing step -- see NeumanSMPLXDataset._world_bone_transforms's
+    docstring. camera.bone_transforms is used only as a fallback for
+    datasets that don't populate `body_model`/`align_matrix` (i.e. not
+    NeumanSMPLXDataset)."""
+
+    def __init__(self, cfg: DictConfig, metadata: MHRMetadata) -> None:
+        super().__init__(cfg)
+        # List-wrapped so nn.Module.__setattr__ doesn't auto-register this as
+        # a submodule -- body_model is OWNED (as a real submodule, so its
+        # parameters land in the optimizer) by SMPLXTemplateOptimization
+        # (src/models/pose_correction/cto.py) alone; VertexLBS only ever
+        # calls read-only methods on it. Registering it here too would make
+        # its parameters reachable from two different `.parameters()` calls,
+        # which torch.optim.Adam rejects ("appear in more than one parameter
+        # group") -- mirrors DirectPoseOptimization's `_mhr_model` pattern.
+        self._body_model: list[object] = [metadata.get("body_model", None)]
+        # Fallback only (datasets without a `body_model`/`align_matrix`, i.e.
+        # not NeumanSMPLXDataset); moved to the right device lazily in
+        # forward() rather than registered as a buffer, since VertexLBS has
+        # no other parameters/buffers to co-locate it with.
+        self.skinning_weights_static = torch.from_numpy(metadata["skinning_weights"]).float()
+
+    @property
+    def body_model(self):  # type: ignore[no-untyped-def]
+        return self._body_model[0]
+
+    def forward(self, gaussians: GaussianModel, iteration: int, camera: Camera) -> GaussianModel:
+        xyz = gaussians.get_xyz
+        n_pts = xyz.shape[0]
+
+        if self.body_model is not None and camera.align_matrix is not None:
+            _, _, bone_transforms_local = self.body_model.pose_transforms(camera.rots)
+            bone_transforms_local = bone_transforms_local[0]  # (J,4,4)
+            tfs = torch.matmul(camera.align_matrix.unsqueeze(0), bone_transforms_local)  # (J,4,4)
+            W = self.body_model.skinning_weights().to(xyz.device)
+        else:
+            tfs = camera.bone_transforms[0]
+            W = self.skinning_weights_static.to(xyz.device)
+
+        assert W.shape[0] == n_pts, (
+            f"VertexLBS requires one Gaussian per canonical mesh vertex: got {n_pts} Gaussians "
+            f"but {W.shape[0]} skinning-weight rows -- Scene.gaussians must be created via "
+            "create_from_pcd(metadata['cano_verts'], ...) with no densification/pruning."
+        )
+        T_fwd = torch.einsum("vj,jab->vab", W, tfs)
+
+        deformed_gaussians = gaussians.clone()
+        deformed_gaussians.set_fwd_transform(T_fwd.detach())
+
+        homo_coord = torch.ones(n_pts, 1, dtype=torch.float32, device=xyz.device)
+        x_hat_homo = torch.cat([xyz, homo_coord], dim=-1).view(n_pts, 4, 1)
+        x_bar = torch.matmul(T_fwd, x_hat_homo)[:, :3, 0]
+        deformed_gaussians._xyz = x_bar
+
+        rotation_hat = build_rotation(gaussians._rotation)
+        rotation_bar = torch.matmul(T_fwd[:, :3, :3], rotation_hat)
+        deformed_gaussians.rotation_precomp = rotation_bar
+
+        return deformed_gaussians
+
+    def regularization(self) -> dict[str, torch.Tensor]:
+        return {}
+
+
 def get_rigid_deform(cfg: DictConfig, metadata: MHRMetadata) -> RigidDeform:
     name = cfg.name
     model_dict = {
         "skinning_field": SkinningField,  # paper default
+        "vertex_lbs": VertexLBS,  # GA-Avatar: 1 Gaussian per canonical mesh vertex
     }
     return model_dict[name](cfg, metadata)

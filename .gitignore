@@ -16,3 +16,4 @@ SIBR_viewers
 *.ply
 .venv
 runs/
+*.log

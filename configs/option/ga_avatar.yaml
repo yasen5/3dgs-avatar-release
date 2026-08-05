@@ -1,0 +1,64 @@
+# @package _global_
+# GA-Avatar's training schedule: NeuMan budget is "5 epochs, each iterating
+# over the training data 80 times" per the paper -- for citron's 30 train
+# frames that's 5*80*30 = 12000 iterations. Densification/pruning is
+# disabled entirely: GA-Avatar's Gaussian count is fixed (1 per canonical
+# mesh vertex), never added to or pruned.
+
+opt:
+  iterations: 12000
+  lr_schedule: milestone  # -> x0.1 at 75% of iterations, x0.1 again at 95% (see GaussianConverter.set_optimizer)
+
+  densify_from_iter: 0
+  densify_until_iter: 0  # never densifies/prunes -- 1 Gaussian per canonical vertex, fixed
+
+  lambda_l1: 0.8      # paper's lambda_RGB
+  lambda_dssim: 0.2   # paper's lambda_SSIM (already wired to `1 - ssim(...)` in scripts/train.py)
+  lambda_perceptual: 1.0  # paper's lambda_LPIPS
+  # The paper's own L = L_color + L_reg + L_geo has no silhouette/mask term
+  # (unlike the MHR pipeline's convention) -- 0 both to match the paper
+  # exactly and to skip the opacity_render rasterizer pass entirely (memory,
+  # see `downsample` in configs/dataset/neuman_citron_smplx.yaml).
+  lambda_mask: 0.0
+
+  # L_off (weights on GeoNet's own delta_mu_f/delta_mu_p and s_f/delta_s_p,
+  # computed in GAAvatarGeo.forward -> loss_reg keys 'ga_off_mu'/'ga_off_scale')
+  lambda_ga_off_mu: 10.0     # paper's lambda_mu
+  lambda_ga_off_scale: 1.0   # paper's lambda_s
+  # L_lap (mesh-Laplacian smoothness on the same two quantities)
+  lambda_ga_lap_mu: 1e5      # paper's lambda_l
+  lambda_ga_lap_scale: 1e5   # paper's lambda_l
+
+  # L_geo: normal + depth losses against Sapiens-precomputed maps.
+  # Real Sapiens depth (sapiens_depth/*.npy) and normal (sapiens_normal/*.png)
+  # maps now both exist for citron -- both terms enabled at the paper's
+  # weights. scripts/train.py gates return_normal/return_depth on
+  # lambda_normal/lambda_depth_* > 0 and NeumanSMPLXDataset.load_normal_map/
+  # load_depth_map return None per-frame if a given map is still missing
+  # (e.g. for other NeuMan sequences that don't have sapiens_normal/ yet).
+  lambda_normal: 1.0        # paper's lambda_n
+  lambda_depth_local: 4e-5  # paper's lambda_p
+  lambda_depth_global: 4e-4 # paper's lambda_g
+
+model:
+  gaussian:
+    fix_rotation_opacity: true
+    init_opacity: 0.999
+    # GaussianModel's OWN optimizer (raw per-Gaussian _xyz/_scaling/_features,
+    # see Scene.optimize) never steps: GA-Avatar's networks (GeoNet/RGBNet/
+    # Triplane/CTO) own every real degree of freedom; the raw point cloud
+    # create_from_pcd seeds is a fixed, unused initialization.
+    delay: 100000000
+
+pipeline:
+  pose_noise: 0.0  # GA-Avatar holds pose fixed; no reason to jitter camera.rots
+
+test_interval: 2000
+save_iterations: [12000]
+# Periodic checkpoints (in addition to the automatic one at the final
+# iteration, see scripts/train.py's `config.checkpoint_iterations.append`)
+# so a crash/disk-full near the end of a ~1hr run costs at most 2000
+# iterations of progress instead of the whole run -- resume with
+# `start_checkpoint=<path>`. ckpt files are ~240MB each; 6 of them is
+# negligible next to the run's own runtime.
+checkpoint_iterations: [2000, 4000, 6000, 8000, 10000]

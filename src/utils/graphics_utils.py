@@ -17,6 +17,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import numpy.typing as npt
 import torch
+import torch.nn.functional as F
 
 
 class BasicPointCloud(NamedTuple):
@@ -91,3 +92,20 @@ def fov2focal(fov: float, pixels: float) -> float:
 
 def focal2fov(focal: float, pixels: float) -> float:
     return 2 * math.atan(pixels / (2 * focal))
+
+
+def compute_vertex_normals(verts: torch.Tensor, faces: npt.NDArray[np.integer[Any]]) -> torch.Tensor:
+    """Per-vertex normals from face connectivity (area-weighted face-normal
+    average at each vertex), for GA-Avatar's rendered normal map (L_n) --
+    only meaningful when `verts` is in mesh-vertex order (i.e. GA-Avatar's
+    VertexLBS mode, one Gaussian per canonical mesh vertex), not for
+    free-form/densified Gaussian point clouds."""
+    faces_t = torch.as_tensor(faces, dtype=torch.long, device=verts.device)
+    v0, v1, v2 = verts[faces_t[:, 0]], verts[faces_t[:, 1]], verts[faces_t[:, 2]]
+    face_normals = torch.cross(v1 - v0, v2 - v0, dim=1)  # unnormalized -- magnitude = 2x triangle area
+
+    vertex_normals = torch.zeros_like(verts)
+    for i in range(3):
+        vertex_normals.index_add_(0, faces_t[:, i], face_normals)
+
+    return F.normalize(vertex_normals, dim=1, eps=1e-8)

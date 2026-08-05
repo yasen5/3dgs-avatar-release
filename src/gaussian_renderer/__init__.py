@@ -21,6 +21,7 @@ from omegaconf import DictConfig
 from src.scene import Scene
 from src.scene.cameras import Camera
 from src.scene.gaussian_model import GaussianModel
+from src.utils.graphics_utils import compute_vertex_normals
 
 
 class RenderOutput(TypedDict):
@@ -31,6 +32,8 @@ class RenderOutput(TypedDict):
     radii: torch.Tensor
     loss_reg: dict[str, torch.Tensor]
     opacity_render: torch.Tensor | None
+    normal_render: torch.Tensor | None
+    depth_render: torch.Tensor | None
 
 
 def render(data: Camera,
@@ -41,7 +44,9 @@ def render(data: Camera,
            scaling_modifier: float = 1.0,
            override_color: torch.Tensor | None = None,
            compute_loss: bool = True,
-           return_opacity: bool = False) -> RenderOutput:
+           return_opacity: bool = False,
+           return_normal: bool = False,
+           return_depth: bool = False) -> RenderOutput:
     """
     Render the scene.
 
@@ -120,6 +125,54 @@ def render(data: Camera,
             cov3D_precomp=cov3D_precomp)
         opacity_image = opacity_image[:1]
 
+    normal_image: torch.Tensor | None = None
+    if return_normal:
+        # GA-Avatar's L_n needs a rendered normal map: per-vertex mesh
+        # normals (face-connectivity based, computed on `pc`'s ALREADY-posed
+        # positions so they reflect this frame's articulation), rasterized
+        # exactly like the opacity pass above -- one more colors_precomp swap
+        # reusing the same deformed Gaussians, not a second deformation pass.
+        # scene.metadata['faces'] is topology (pose/CTO-independent), so it's
+        # safe to reuse verbatim regardless of which body_model backend built it.
+        #
+        # KNOWN GAP (currently harmless since lambda_normal=0 in
+        # configs/option/ga_avatar.yaml until Sapiens normal maps are
+        # generated for a sequence): these are WORLD-space normals.
+        # /mnt/ssd2/tavatar_data_prep/run_sapiens_normals.py's output is
+        # camera/view-space (standard for that kind of normal predictor).
+        # Before enabling L_n, either rotate this by `data.R` into camera
+        # space or rotate the loaded GT by `data.R.T` into world space in
+        # scripts/train.py before calling normal_map_loss -- comparing them
+        # as-is would silently penalize a geometrically-correct prediction.
+        vertex_normals = compute_vertex_normals(means3D, scene.metadata['faces'])
+        normal_image, _ = rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            shs=None,
+            colors_precomp=vertex_normals,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp)
+
+    depth_image: torch.Tensor | None = None
+    if return_depth:
+        # Same reused-Gaussians pattern as the opacity/normal passes: per-
+        # Gaussian camera-space depth (Z, from the world-to-view transform)
+        # as colors_precomp, for GA-Avatar's L_d (depth_loss_local/_global).
+        means3D_homo = torch.cat([means3D, torch.ones_like(means3D[:, :1])], dim=1)
+        cam_space = means3D_homo @ data.world_view_transform
+        depth_z = cam_space[:, 2:3].expand(-1, 3).contiguous()
+        depth_image, _ = rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            shs=None,
+            colors_precomp=depth_z,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp)
+        depth_image = depth_image[:1]
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
@@ -130,4 +183,6 @@ def render(data: Camera,
             "radii": radii,
             "loss_reg": loss_reg,
             "opacity_render": opacity_image,
+            "normal_render": normal_image,
+            "depth_render": depth_image,
             }

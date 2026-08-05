@@ -1,0 +1,46 @@
+# @package _global_
+# GA-Avatar's GeoNet (src/models/deformer/non_rigid.py's GAAvatarGeo): base
+# MLP(F_tri) -> static (delta_mu_f, s_f), refine MLP(F_tri, theta) ->
+# pose-dependent (delta_mu_p, delta_s_p). 4 FC layers x 128 channels, per the
+# paper's stated MLP architecture (shared by all four GeoNet/RGBNet MLPs).
+
+non_rigid_name: ga_avatar_geo
+
+model:
+  triplane:
+    body:
+      resolution: 128
+      channels: 32
+    face:
+      # Paper doesn't give an explicit face-triplane resolution beyond
+      # "higher-resolution"; 256 is our choice, not from the paper.
+      resolution: 256
+      channels: 32
+
+  deformer:
+    non_rigid:
+      name: ga_avatar_geo
+      delay: 0
+      pose_dim: 165  # 55 SMPL-X joints x 3 (axis-angle) -- see NeumanSMPLXDataset._assemble_smplx_pose
+      mlp_base:
+        n_neurons: 128
+        n_hidden_layers: 4
+        skip_in: []
+        cond_in: []
+        multires: 0
+        last_layer_init: false
+      mlp_refine:
+        n_neurons: 128
+        n_hidden_layers: 4
+        skip_in: []
+        cond_in: [ 0 ]
+        multires: 0
+        last_layer_init: false
+
+opt:
+  non_rigid_lr: 1e-3
+  nr_latent_lr: 1e-3
+  lambda_ga_off_mu: 10.0
+  lambda_ga_off_scale: 1.0
+  lambda_ga_lap_mu: 1e5
+  lambda_ga_lap_scale: 1e5

@@ -14,6 +14,8 @@ from __future__ import annotations
 from math import exp
 from typing import NamedTuple
 
+import numpy as np
+import scipy.sparse
 import torch
 import torch.nn.functional as F
 from pytorch3d.ops.knn import knn_points
@@ -130,3 +132,84 @@ def aiap_loss(
     loss = F.l1_loss(dists_canonical, dists_deformed)
 
     return loss
+
+
+# --- GA-Avatar losses --------------------------------------------------------
+
+def sparse_laplacian_to_torch(laplacian: scipy.sparse.spmatrix, device: str | torch.device = "cpu") -> torch.Tensor:
+    """One-time conversion of a scipy.sparse (V,V) mesh Laplacian (e.g. from
+    `trimesh.smoothing.laplacian_calculation`, as stored in
+    `metadata['laplacian']`) into a torch sparse COO tensor, for repeated
+    `torch.sparse.mm` use in `laplacian_loss` every training step."""
+    coo = laplacian.tocoo()
+    indices = torch.from_numpy(np.vstack([coo.row, coo.col]).astype(np.int64))
+    values = torch.from_numpy(coo.data.astype(np.float32))
+    return torch.sparse_coo_tensor(indices, values, coo.shape, device=device).coalesce()
+
+
+def laplacian_loss(delta: torch.Tensor, laplacian: torch.Tensor) -> torch.Tensor:
+    """GA-Avatar's L_lap: mesh-graph-Laplacian smoothness penalty on a
+    per-vertex quantity (position or scale offset). `laplacian` is a torch
+    sparse (V,V) tensor from `sparse_laplacian_to_torch`."""
+    smoothed = torch.sparse.mm(laplacian, delta)
+    result: torch.Tensor = smoothed.pow(2).sum(dim=1).mean()
+    return result
+
+
+def normal_map_loss(normal_pred: torch.Tensor, normal_gt: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    """GA-Avatar's L_n: L1 + (1 - cosine) between rendered and Sapiens-
+    precomputed normal maps, restricted to `valid_mask` (foreground)
+    pixels. `normal_pred`/`normal_gt`: (3,H,W); `valid_mask`: (1,H,W) or
+    (H,W) boolean/float."""
+    mask = valid_mask.reshape(1, *valid_mask.shape[-2:]).to(dtype=torch.bool)
+    mask3 = mask.expand_as(normal_pred)
+    n_valid = mask.sum().clamp_min(1)
+
+    l1_term = (normal_pred - normal_gt).abs()[mask3].sum() / (3 * n_valid)
+
+    cos = F.cosine_similarity(normal_pred, normal_gt, dim=0, eps=1e-8).unsqueeze(0)
+    cos_term = (1.0 - cos)[mask].sum() / n_valid
+
+    result: torch.Tensor = l1_term + cos_term
+    return result
+
+
+def _patch_normalize(x: torch.Tensor, patch_size: int, eps: float = 1e-6) -> torch.Tensor:
+    """(1,H,W) -> per-`patch_size`x`patch_size`-patch (mean, std)-normalized map,
+    for the local depth term's ``D^p = (d - mean_p) / (std_p + eps)``."""
+    c, h, w = x.shape
+    pad_h = (-h) % patch_size
+    pad_w = (-w) % patch_size
+    x_pad = F.pad(x, (0, pad_w, 0, pad_h))
+    ph, pw = x_pad.shape[-2] // patch_size, x_pad.shape[-1] // patch_size
+    patches = x_pad.reshape(c, ph, patch_size, pw, patch_size).permute(0, 1, 3, 2, 4).reshape(c, ph, pw, -1)
+    mean = patches.mean(dim=-1, keepdim=True)
+    std = patches.std(dim=-1, keepdim=True)
+    normed = (patches - mean) / (std + eps)
+    normed = normed.reshape(c, ph, pw, patch_size, patch_size).permute(0, 1, 3, 2, 4).reshape(c, h + pad_h, w + pad_w)
+    return normed[:, :h, :w]
+
+
+def depth_loss_local(
+    depth_pred: torch.Tensor, depth_gt: torch.Tensor, valid_mask: torch.Tensor, patch_size: int = 32
+) -> torch.Tensor:
+    """GA-Avatar's local depth term: per-patch mean/std-normalized L2,
+    restricted to `valid_mask`. depth_pred/depth_gt: (1,H,W)."""
+    mask = valid_mask.reshape(1, *valid_mask.shape[-2:]).to(dtype=torch.bool)
+    d_pred_n = _patch_normalize(depth_pred, patch_size)
+    d_gt_n = _patch_normalize(depth_gt, patch_size)
+    result: torch.Tensor = ((d_pred_n - d_gt_n) ** 2)[mask].mean()
+    return result
+
+
+def depth_loss_global(
+    depth_pred: torch.Tensor, depth_gt: torch.Tensor, valid_mask: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """GA-Avatar's global depth term: single whole-image std-normalized L2,
+    restricted to `valid_mask`. depth_pred/depth_gt: (1,H,W)."""
+    mask = valid_mask.reshape(1, *valid_mask.shape[-2:]).to(dtype=torch.bool)
+    gt_std = depth_gt[mask].std() + eps
+    d_pred_n = (depth_pred - depth_pred[mask].mean()) / gt_std
+    d_gt_n = (depth_gt - depth_gt[mask].mean()) / gt_std
+    result: torch.Tensor = ((d_pred_n - d_gt_n) ** 2)[mask].mean()
+    return result

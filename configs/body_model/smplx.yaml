@@ -1,0 +1,5 @@
+name: smplx
+model_path: /mnt/ssd2/smplx
+gender: neutral
+num_betas: 10
+n_subdivisions: 2

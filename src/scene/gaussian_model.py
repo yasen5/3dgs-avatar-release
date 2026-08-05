@@ -104,6 +104,14 @@ class GaussianModel:
         self.non_rigid_feature: torch.Tensor | None = None
         self.fwd_transform: torch.Tensor | None = None
         self.rotation_precomp: torch.Tensor | None = None
+        # GA-Avatar only: canonical (pre-rigid-LBS) per-Gaussian position,
+        # set by GAAvatarGeo.forward before VertexLBS poses `_xyz` into
+        # world space -- GAAvatarRGB reads this (not the now-posed
+        # `get_xyz`) so RGBNet's triplane query matches GeoNet's and stays
+        # within the canonical-mesh AABB the triplane/planes were fit
+        # against. See GAAvatarRGB.forward's docstring for the bug this
+        # fixes.
+        self.canonical_xyz: torch.Tensor | None = None
 
         self.setup_functions()
 
@@ -113,6 +121,8 @@ class GaussianModel:
         cloned.active_sh_degree = self.active_sh_degree
         if self.non_rigid_feature is not None:
             cloned.non_rigid_feature = self.non_rigid_feature
+        if self.canonical_xyz is not None:
+            cloned.canonical_xyz = self.canonical_xyz
 
         parameters = ["_xyz",
                       "_features_dc",
@@ -251,10 +261,16 @@ class GaussianModel:
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / feature_ratio, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
+        # GA-Avatar: rotation is fixed identity and opacity is fixed at
+        # (near-)1 for every Gaussian, per the paper -- excluded from the
+        # optimizer entirely rather than given a param group, so they never
+        # drift from their create_from_pcd() init (identity quat, init_opacity
+        # close to 1 via the ga_avatar option config).
+        if not self.cfg.get('fix_rotation_opacity', False):
+            l.append({'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"})
+            l.append({'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=ADAM_EPS)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,

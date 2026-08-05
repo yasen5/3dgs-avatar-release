@@ -1,0 +1,46 @@
+# @package _global_
+# GA-Avatar's RGBNet (src/models/texture/texture.py's GAAvatarRGB): base
+# MLP(F_tri) -> static c_f, refine MLP(F_tri, theta) -> pose-dependent
+# delta_c_p. Shares the Triplane built by configs/non_rigid/ga_avatar_geo.yaml.
+
+texture_name: ga_avatar_rgb
+
+model:
+  gaussian:
+    use_sh: false
+    feature_dim: 3  # unused by GAAvatarRGB (color comes from the triplane, not gaussians.get_features); kept >0 only so GaussianModel.create_from_pcd's feature tensor allocation is well-formed
+  texture:
+    name: ga_avatar_rgb
+    pose_dim: 165
+    # c = (tanh(c_f_logit + delta_c_p) + 1) / 2 -- both branches produce raw
+    # logits combined additively BEFORE a single final tanh (see
+    # GAAvatarRGB.forward; tanh over sigmoid to match ExAvatar's convention,
+    # the paper itself doesn't specify). Both last layers use the near-zero
+    # init so the sum starts near 0 (color ~= mid-gray) instead of one branch
+    # dominating at init. This replaced an earlier clamp(sigmoid(c_f) +
+    # delta_c_p, 0, 1) formulation that hard-clamped the sum: torch.clamp has
+    # exactly-zero gradient for any excursion outside [0,1], and empirically
+    # (v2-v5, confirmed via checkpoint weight diffing) delta_c_p reliably
+    # drifted the sum negative for ~100% of Gaussians within the first few
+    # hundred iterations regardless of refine-branch init alone, permanently
+    # freezing RGBNet (PSNR stuck ~20.9 vs the paper's 29.63).
+    mlp_base:
+      n_neurons: 128
+      n_hidden_layers: 4
+      skip_in: []
+      cond_in: []
+      multires: 0
+      last_layer_init: true
+    mlp_refine:
+      n_neurons: 128
+      n_hidden_layers: 4
+      skip_in: []
+      cond_in: [ 0 ]
+      multires: 0
+      last_layer_init: true
+
+opt:
+  feature_lr: 1e-3
+  texture_lr: 1e-3
+  tex_latent_lr: 1e-3
+  latent_weight_decay: 0.05

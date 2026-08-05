@@ -24,22 +24,32 @@ from __future__ import annotations
 
 import os
 from typing import Any, TypedDict
-from typing_extensions import NotRequired
+from typing_extensions import NotRequired, TypeAlias
 
 import cv2
 import numpy as np
 import numpy.typing as npt
 import torch
 import trimesh
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Dataset
 
 from src.body_models import mhr_lbs
+from src.body_models.mhr_body_model import MHRBodyModel
+from src.body_models.metadata import CanonicalMetadata, ModelMetadata
 from src.body_models.mhr_utils import build_big_pose_model_params, local_joint_rotmats
 from src.constants import CAMERAS_EXTENT, MHR_MODEL_PARAMS_DIM, MHR_SHAPE_DIM
 from src.scene.cameras import Camera
 from src.utils.dataset_utils import AABB, fetchPly, storePly
 from src.utils.graphics_utils import BasicPointCloud, focal2fov
+
+# Backward-compat aliases: these two TypedDicts used to be defined here and
+# were MHR-only. They now live in src.body_models.metadata as the generic
+# CanonicalMetadata/ModelMetadata (used by both the MHR and SMPL-X backends);
+# re-exported under their original names so every existing MHR call site
+# (`MHRCanonicalMetadata`, `MHRMetadata`) keeps working unmodified.
+MHRCanonicalMetadata: TypeAlias = CanonicalMetadata
+MHRMetadata: TypeAlias = ModelMetadata
 
 
 class MHRParms(TypedDict):
@@ -53,35 +63,6 @@ class MHRParms(TypedDict):
     # only present in the {train,test}/mhr_parms.pth layout, and even there
     # only for keyframe-tracked runs -- see _load_prepared_source's `in` check.
     is_keyframe: NotRequired[torch.Tensor]
-
-
-class MHRCanonicalMetadata(TypedDict):
-    """Fields present in `MHRNativeDataset.metadata` regardless of split."""
-    cano_verts: npt.NDArray[np.floating[Any]]
-    skinning_weights: npt.NDArray[np.floating[Any]]
-    faces: npt.NDArray[np.integer[Any]]
-    cano_mesh: trimesh.Trimesh
-    joint_parents: npt.NDArray[np.integer[Any]]
-    big_pose_joint_pos: torch.Tensor
-    big_pose_joint_rotmat: torch.Tensor
-    jtr_norm: torch.Tensor
-    coord_min: npt.NDArray[np.floating[Any]]
-    coord_max: npt.NDArray[np.floating[Any]]
-    aabb: AABB
-
-
-class MHRMetadata(MHRCanonicalMetadata):
-    """`MHRNativeDataset.metadata` for the (always-loaded) 'train' split, which is
-    the only split any model consumer reads (see `Scene.metadata` in scene/__init__.py).
-    Non-train splits only populate `MHRCanonicalMetadata`'s fields."""
-    cameras_extent: float
-    frame_dict: dict[str, int]
-    mhr_model: torch.jit.ScriptModule
-    mhr_model_path: str
-    model_params_all: torch.Tensor
-    shape_params_all: torch.Tensor
-    cam_t_all: torch.Tensor
-    is_keyframe: npt.NDArray[np.bool_]
 
 
 class RawFrame(TypedDict):
@@ -131,9 +112,28 @@ class MHRNativeDataset(Dataset[Camera]):
 
         self.mhr_model = mhr_lbs.load_mhr(cfg.mhr_model_path, device=self.device)
         state_dict = mhr_lbs.mhr_state_dict(cfg.mhr_model_path)
-        self.faces = mhr_lbs.faces(state_dict).numpy()
-        self.dense_skinning_weights = mhr_lbs.dense_skinning_weights(state_dict).numpy()
-        self.joint_parents = mhr_lbs.joint_parents(state_dict)
+        # Keep the native MHR model/query fields below for existing MHR-only
+        # consumers, but expose the exact same initialized mesh abstraction as
+        # the SMPL-X dataset. The adapter reuses this already-loaded rig rather
+        # than loading a second TorchScript copy.
+        first_shape = self.parms["shape_params"][0].float().reshape(-1).tolist()
+        first_model_params = self.parms["model_params"][0].float().reshape(-1)
+        canonical_model_params = build_big_pose_model_params(first_model_params).tolist()
+        body_model_cfg = OmegaConf.create({
+            "model_path": cfg.mhr_model_path,
+            "device": self.device,
+            "shape_params": first_shape,
+            "canonical_model_params": canonical_model_params,
+            "learn_shape": False,
+        })
+        self.body_model = MHRBodyModel(
+            body_model_cfg,
+            model=self.mhr_model,
+            state_dict=state_dict,
+        )
+        self.faces = self.body_model.faces()
+        self.dense_skinning_weights = self.body_model.skinning_weights().numpy()
+        self.joint_parents = torch.from_numpy(self.body_model.joint_parents())
 
         self.metadata: MHRCanonicalMetadata | MHRMetadata
         self.get_metadata()
@@ -410,6 +410,9 @@ class MHRNativeDataset(Dataset[Camera]):
             'coord_min': coord_min,
             'coord_max': coord_max,
             'aabb': AABB(coord_max.astype(np.float32), coord_min.astype(np.float32)),
+            'body_model': self.body_model,
+            'face_vertex_mask': self.body_model.face_region_mask(),
+            'laplacian': self.body_model.laplacian(cano_mesh),
         }
 
         if self.split != 'train':

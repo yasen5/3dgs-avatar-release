@@ -4,9 +4,11 @@
 The script deliberately runs the estimators on a mesh-derived person crop,
 then restores both predictions to the original frame size expected by
 GA-Avatar.  Sapiens2 segmentation is loaded from the local Hugging Face cache
-only.  The depth estimator is the original Sapiens depth model in its official
-TorchScript/Lite format; a missing depth checkpoint is downloaded once through
-the Hugging Face cache unless ``--no-download-depth`` is supplied.
+only.  The default depth estimator is the largest CUDA-safe Sapiens checkpoint
+selected for this repository: the 1B BF16 PyTorch Export model.  TorchScript/
+Lite depth checkpoints remain supported when passed explicitly.  A missing
+default depth checkpoint is downloaded once through the Hugging Face cache
+unless ``--no-download-depth`` is supplied.
 
 MHR example::
 
@@ -27,10 +29,21 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import pickle
 import sys
+import struct
+import subprocess
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
+
+# Keep direct ``python scripts/...`` invocation working.  The script imports
+# the repository's dataset/body-model code below, while Python otherwise puts
+# only ``scripts/`` (not the repository root) on sys.path.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import cv2
 import numpy as np
@@ -41,8 +54,8 @@ import torch.nn.functional as F
 LOGGER = logging.getLogger("prepare_sapiens_ga_avatar")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 DEFAULT_SEG_MODEL = "facebook/sapiens2-seg-0.4b"
-DEFAULT_DEPTH_REPO = "facebook/sapiens-depth-2b-torchscript"
-DEFAULT_DEPTH_FILE = "sapiens_2b_render_people_epoch_25_torchscript.pt2"
+DEFAULT_DEPTH_REPO = "facebook/sapiens-depth-1b-bfloat16"
+DEFAULT_DEPTH_FILE = "sapiens_1b_render_people_epoch_88_bfloat16.pt2"
 
 
 @dataclass(frozen=True)
@@ -182,16 +195,22 @@ class MHRFrameSource:
 class SMPLXFrameSource:
     """Read the repository's NeuMan SMPL-X dataset through its BodyModel."""
 
-    def __init__(self, dataset_config: Path, split: str) -> None:
+    def __init__(self, dataset_config: Path, split: str, dataset_root: Path | None = None) -> None:
         from omegaconf import OmegaConf
         from src.dataset.neuman_smplx import NeumanSMPLXDataset
 
         config = OmegaConf.load(str(dataset_config))
         cfg = config.dataset
+        if dataset_root is not None:
+            cfg.root_dir = str(dataset_root.expanduser().resolve())
+        prep_subdivisions = os.environ.get("SAPIENS_PREP_SUBDIVISIONS")
+        if prep_subdivisions is not None:
+            cfg.body_model.n_subdivisions = int(prep_subdivisions)
         cfg.preload = False
-        cfg.data_device = "cpu"
+        cfg.data_device = "cuda"
         self.dataset = NeumanSMPLXDataset(cfg, split=split)
         self.body_model = self.dataset.body_model
+        self.body_model.cuda()
 
     def frames(self) -> Iterator[FrameGeometry]:
         from src.body_models.base import skin_vertices
@@ -201,7 +220,9 @@ class SMPLXFrameSource:
             for frame_index, frame_id in enumerate(self.dataset.frame_ids):
                 raw = self.dataset.load_raw(frame_index)
                 _, bone_world = self.dataset._world_bone_transforms(frame_id)
-                vertices_world = skin_vertices(self.body_model, bone_world.to(rest_device))[0]
+                # ``skin_vertices`` returns (V,3) for a single (J,4,4)
+                # transform and (B,V,3) only for batched transforms.
+                vertices_world = skin_vertices(self.body_model, bone_world.to(rest_device))
                 vertices_world = vertices_world.detach().cpu().numpy().astype(np.float32)
                 vertices_camera = vertices_world @ np.asarray(raw["R"], dtype=np.float32) + np.asarray(raw["T"], dtype=np.float32)
                 cam = self.dataset._colmap_cam
@@ -322,6 +343,18 @@ class Sapiens2Segmenter:
         return logits.argmax(dim=1)[0].cpu().numpy() != 0
 
 
+def _read_exact(stream: Any, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise RuntimeError("CUDA depth worker closed its output stream")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _resolve_depth_checkpoint(explicit: Path | None, allow_download: bool) -> Path:
     if explicit is not None:
         path = explicit.expanduser().resolve()
@@ -334,7 +367,7 @@ def _resolve_depth_checkpoint(explicit: Path | None, allow_download: bool) -> Pa
 
     cache_root = Path.home() / ".cache" / "huggingface" / "hub"
     cached = sorted(cache_root.glob(
-        "models--facebook--sapiens-depth-2b-torchscript/snapshots/*/" + DEFAULT_DEPTH_FILE
+        f"models--{DEFAULT_DEPTH_REPO.replace('/', '--')}/snapshots/*/{DEFAULT_DEPTH_FILE}"
     ))
     if cached:
         return cached[-1].resolve()
@@ -349,7 +382,7 @@ def _resolve_depth_checkpoint(explicit: Path | None, allow_download: bool) -> Pa
     except Exception as exc:
         raise RuntimeError(
             f"could not download {DEFAULT_DEPTH_REPO}/{DEFAULT_DEPTH_FILE}; "
-            "pass --depth-checkpoint to a local Sapiens-Lite TorchScript file"
+            "pass --depth-checkpoint to a local Sapiens depth checkpoint"
         ) from exc
     return Path(downloaded).resolve()
 
@@ -358,15 +391,56 @@ class SapiensDepth:
     def __init__(self, checkpoint: Path, device: str) -> None:
         LOGGER.info("Loading Sapiens depth checkpoint %s", checkpoint)
         self.device = torch.device(device)
-        self.model = torch.jit.load(str(checkpoint), map_location=self.device).eval().to(self.device)
+        self._worker: subprocess.Popen[bytes] | None = None
+        with zipfile.ZipFile(checkpoint) as archive:
+            is_exported_program = "serialized_exported_program.json" in archive.namelist()
+        if is_exported_program:
+            worker_python = os.environ.get("SAPIENS_DEPTH_PYTHON")
+            if worker_python and Path(worker_python).absolute() != Path(sys.executable).absolute():
+                worker_script = Path(__file__).resolve().with_name("sapiens_depth_worker.py")
+                self._worker = subprocess.Popen(
+                    [worker_python, "-u", str(worker_script), "--checkpoint", str(checkpoint)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=None,
+                    bufsize=0,
+                )
+                self.model = None
+                self.input_dtype = None
+                LOGGER.info("Using CUDA BF16 depth worker %s", worker_python)
+                return
+            # BF16 Sapiens checkpoints are PyTorch Export archives.  Their
+            # exported module intentionally does not implement eval(); it is
+            # already serialized with inference weights.
+            self.model = torch.export.load(str(checkpoint)).module().to(self.device)
+            self.input_dtype = torch.bfloat16
+        else:
+            self.model = torch.jit.load(str(checkpoint), map_location=self.device).eval().to(self.device)
+            self.input_dtype = torch.float32
 
     def predict(self, masked_crop_bgr: np.ndarray) -> np.ndarray:
         height, width = masked_crop_bgr.shape[:2]
+        if self._worker is not None:
+            assert self._worker.stdin is not None and self._worker.stdout is not None
+            request = pickle.dumps(masked_crop_bgr, protocol=pickle.HIGHEST_PROTOCOL)
+            self._worker.stdin.write(struct.pack("!Q", len(request)))
+            self._worker.stdin.write(request)
+            self._worker.stdin.flush()
+            header = _read_exact(self._worker.stdout, 8)
+            if len(header) != 8:
+                raise RuntimeError("CUDA depth worker exited before returning a result")
+            size = struct.unpack("!Q", header)[0]
+            response = pickle.loads(_read_exact(self._worker.stdout, size))
+            if isinstance(response, dict) and "error" in response:
+                raise RuntimeError(f"CUDA depth worker failed: {response['error']}")
+            return np.asarray(response, dtype=np.float32)
         image = cv2.resize(masked_crop_bgr, (768, 1024), interpolation=cv2.INTER_LINEAR)
         image = torch.from_numpy(image[..., ::-1].transpose(2, 0, 1).copy()).float()
         mean = torch.tensor([123.5, 116.5, 103.5]).view(3, 1, 1)
         std = torch.tensor([58.5, 57.0, 57.5]).view(3, 1, 1)
-        image = ((image - mean) / std).unsqueeze(0).to(self.device)
+        image = ((image - mean) / std).unsqueeze(0).to(
+            device=self.device, dtype=self.input_dtype
+        )
         with torch.inference_mode():
             output = self.model(image)
             if isinstance(output, (tuple, list)):
@@ -375,6 +449,12 @@ class SapiensDepth:
                 output = output.unsqueeze(1)
             output = F.interpolate(output.float(), size=(height, width), mode="bilinear", align_corners=False)
         return output[0, 0].cpu().numpy().astype(np.float32)
+
+    def close(self) -> None:
+        if self._worker is not None:
+            self._worker.stdin.close()  # type: ignore[union-attr]
+            self._worker.wait(timeout=30)
+            self._worker = None
 
 
 def process_frame(
@@ -434,10 +514,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("mhr", "smplx"), required=True)
     parser.add_argument("--input-root", type=Path, help="MHR camera directory containing images/results/raw")
     parser.add_argument("--dataset-config", type=Path, help="NeuMan/SMPL-X dataset config")
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        help="override dataset.root_dir from --dataset-config (useful for NeuMan subjects)",
+    )
     parser.add_argument("--split", default="train", choices=("train", "val", "test", "predict"))
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--margin", type=float, default=0.25)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="auto", help="device for Sapiens2 segmentation")
+    parser.add_argument(
+        "--depth-device",
+        default="auto",
+        help="CUDA device for Sapiens depth; CPU inference is intentionally unsupported",
+    )
     parser.add_argument("--seg-model", default=DEFAULT_SEG_MODEL)
     parser.add_argument("--sapiens2-root", type=Path)
     parser.add_argument("--seg-checkpoint", type=Path)
@@ -460,7 +550,7 @@ def _build_source(args: argparse.Namespace) -> FrameSource:
         return MHRFrameSource(args.input_root, args.mhr_model)
     if args.dataset_config is None:
         raise ValueError("--dataset-config is required for --backend smplx")
-    return SMPLXFrameSource(args.dataset_config, args.split)
+    return SMPLXFrameSource(args.dataset_config, args.split, args.dataset_root)
 
 
 def main() -> int:
@@ -469,12 +559,15 @@ def main() -> int:
     if args.margin < 0 or args.stride < 1 or args.start < 0:
         raise ValueError("margin must be non-negative, start non-negative, and stride positive")
     device = _select_device(args.device)
+    depth_device = _select_device(args.depth_device)
+    if not device.startswith("cuda") or not depth_device.startswith("cuda"):
+        raise RuntimeError("Sapiens segmentation and depth inference must both run on CUDA")
     source = _build_source(args)
     segmenter = Sapiens2Segmenter(
         args.seg_model, device, args.sapiens2_root, args.seg_checkpoint
     )
     depth_checkpoint = _resolve_depth_checkpoint(args.depth_checkpoint, not args.no_download_depth)
-    depth_model = SapiensDepth(depth_checkpoint, device)
+    depth_model = SapiensDepth(depth_checkpoint, depth_device)
 
     mask_dir = args.output_root.expanduser().resolve() / "masks"
     depth_dir = args.output_root.expanduser().resolve() / "sapiens_depth"
@@ -497,6 +590,7 @@ def main() -> int:
             "[%d/%d] %s crop=(%d,%d)-(%d,%d) mask_area=%.4f",
             index, len(selected), frame.frame_id, *box, area,
         )
+    depth_model.close()
     return 0
 
 

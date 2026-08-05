@@ -40,7 +40,14 @@ from src.gaussian_renderer import render
 from src.scene import GaussianModel, Scene
 from src.utils.general_utils import PSEvaluator
 from src.utils.general_utils import fix_random
-from src.utils.loss_utils import full_aiap_loss, l1_loss, ssim
+from src.utils.loss_utils import (
+    depth_loss_global,
+    depth_loss_local,
+    full_aiap_loss,
+    l1_loss,
+    normal_map_loss,
+    ssim,
+)
 
 
 def retrieve_scheduled_value(iteration: int, value: float | int | ListConfig) -> float:
@@ -143,6 +150,19 @@ def training(config: DictConfig) -> None:
         lambda_mask = retrieve_scheduled_value(iteration, config.opt.lambda_mask)
         use_mask = lambda_mask > 0.
 
+        # GA-Avatar's L_geo (normal + depth vs. Sapiens-precomputed maps).
+        # Absent from every other config (opt.get(..., 0.) keeps this
+        # backward compatible with MHR configs, which don't define these
+        # fields at all); `use_normal`/`use_depth` additionally require the
+        # dataset to expose load_normal_map/load_depth_map (only
+        # NeumanSMPLXDataset does) and are per-frame gated further below on
+        # whether that frame's GT map actually exists on disk.
+        lambda_normal = retrieve_scheduled_value(iteration, config.opt.get('lambda_normal', 0.))
+        lambda_depth_local = retrieve_scheduled_value(iteration, config.opt.get('lambda_depth_local', 0.))
+        lambda_depth_global = retrieve_scheduled_value(iteration, config.opt.get('lambda_depth_global', 0.))
+        use_normal = lambda_normal > 0. and hasattr(scene.train_dataset, 'load_normal_map')
+        use_depth = (lambda_depth_local > 0. or lambda_depth_global > 0.) and hasattr(scene.train_dataset, 'load_depth_map')
+
         # NOTE: multi-stream concurrent rendering was tried here (each view on
         # its own torch.cuda.Stream) and reverted -- diff_gaussian_rasterization
         # holds internal scratch-buffer state that isn't safe across concurrent
@@ -154,7 +174,8 @@ def training(config: DictConfig) -> None:
         # below (one combined backward+optimizer step per `batch_size` views)
         # rather than concurrent GPU execution.
         render_pkgs = [
-            render(cam, iteration, scene, pipe, background, compute_loss=True, return_opacity=use_mask)
+            render(cam, iteration, scene, pipe, background, compute_loss=True, return_opacity=use_mask,
+                   return_normal=use_normal, return_depth=use_depth)
             for cam in cams
         ]
 
@@ -171,6 +192,9 @@ def training(config: DictConfig) -> None:
         loss_mask = torch.zeros((), device="cuda")
         loss_aiap_xyz = torch.zeros((), device="cuda")
         loss_aiap_cov = torch.zeros((), device="cuda")
+        loss_normal = torch.zeros((), device="cuda")
+        loss_depth_local = torch.zeros((), device="cuda")
+        loss_depth_global = torch.zeros((), device="cuda")
         loss_reg_sums: dict[str, torch.Tensor] = {}
 
         viewspace_point_tensors, visibility_filters, radii_list = [], [], []
@@ -214,6 +238,23 @@ def training(config: DictConfig) -> None:
                 loss_aiap_xyz = loss_aiap_xyz + aiap.xyz
                 loss_aiap_cov = loss_aiap_cov + aiap.covariance
 
+            if use_normal:
+                gt_normal = scene.train_dataset.load_normal_map(cam.frame_id)
+                if gt_normal is not None and render_pkg["normal_render"] is not None:
+                    loss_normal = loss_normal + normal_map_loss(
+                        render_pkg["normal_render"], gt_normal.cuda(), gt_mask
+                    )
+
+            if use_depth:
+                gt_depth = scene.train_dataset.load_depth_map(cam.frame_id)
+                if gt_depth is not None and render_pkg["depth_render"] is not None:
+                    gt_depth = gt_depth.cuda()
+                    depth_render = render_pkg["depth_render"]
+                    if lambda_depth_local > 0.:
+                        loss_depth_local = loss_depth_local + depth_loss_local(depth_render, gt_depth, gt_mask)
+                    if lambda_depth_global > 0.:
+                        loss_depth_global = loss_depth_global + depth_loss_global(depth_render, gt_depth, gt_mask)
+
             for name, value in render_pkg["loss_reg"].items():
                 loss_reg_sums[name] = loss_reg_sums.get(name, torch.zeros((), device="cuda")) + value
 
@@ -224,11 +265,17 @@ def training(config: DictConfig) -> None:
         loss_mask = loss_mask / n_views
         loss_aiap_xyz = loss_aiap_xyz / n_views
         loss_aiap_cov = loss_aiap_cov / n_views
+        loss_normal = loss_normal / n_views
+        loss_depth_local = loss_depth_local / n_views
+        loss_depth_global = loss_depth_global / n_views
         loss_reg = {name: value / n_views for name, value in loss_reg_sums.items()}
 
         loss = lambda_l1 * loss_l1 + lambda_dssim * loss_dssim
         loss += lambda_perceptual * loss_perceptual
         loss += lambda_mask * loss_mask
+        loss += lambda_normal * loss_normal
+        loss += lambda_depth_local * loss_depth_local
+        loss += lambda_depth_global * loss_depth_global
 
         # skinning loss (pose-independent regularization on the shared deformer, not per-view)
         lambda_skinning = retrieve_scheduled_value(iteration, config.opt.lambda_skinning)

@@ -107,12 +107,26 @@ class Scene:
         return colors
 
     def save_checkpoint(self, iteration: int) -> None:
+        # Write to a temp file and only os.replace() it onto the final name
+        # once the write has fully succeeded. A checkpoint that dies partway
+        # through (e.g. disk full) then leaves the *previous* checkpoint (if
+        # any) intact instead of clobbering it with a truncated, unloadable
+        # file -- and doesn't propagate, since a save failure this late in
+        # training must not throw away an otherwise-complete run.
         print("\n[ITER {}] Saving Checkpoint".format(iteration))
-        torch.save((self.gaussians.capture(),
-                    self.converter.state_dict(),
-                    self.converter.optimizer.state_dict(),
-                    self.converter.scheduler.state_dict(),
-                    iteration), self.save_dir + "/ckpt" + str(iteration) + ".pth")
+        final_path = self.save_dir + "/ckpt" + str(iteration) + ".pth"
+        tmp_path = final_path + ".tmp"
+        try:
+            torch.save((self.gaussians.capture(),
+                        self.converter.state_dict(),
+                        self.converter.optimizer.state_dict(),
+                        self.converter.scheduler.state_dict(),
+                        iteration), tmp_path)
+            os.replace(tmp_path, final_path)
+        except Exception as e:
+            print(f"[ITER {iteration}] WARNING: checkpoint save failed ({e!r}); continuing without it")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def load_checkpoint(self, path: str) -> None:
         (gaussian_params, converter_sd, converter_opt_sd, converter_scd_sd, first_iter) = torch.load(path, weights_only=False)

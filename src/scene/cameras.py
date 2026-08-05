@@ -41,6 +41,7 @@ class Camera:
         K: npt.NDArray[np.floating[Any]] | None = None,
         colmap_id: int | None = None,
         uid: int | None = None,
+        align_matrix: torch.Tensor | None = None,
     ) -> None:
         self.frame_id = frame_id
         self.cam_id = cam_id
@@ -59,6 +60,14 @@ class Camera:
         self.K = K
         self.colmap_id = colmap_id
         self.uid = uid
+        # Per-frame world-alignment matrix (4,4): only set by datasets whose
+        # body-model pose needs live re-posing against a learnable rig (e.g.
+        # NeumanSMPLXDataset's CTO path -- see VertexLBS), which must recompute
+        # bone_transforms from camera.rots + the body model's CURRENT
+        # parameters every step rather than reusing the frozen
+        # camera.bone_transforms computed once at dataset-load time. None for
+        # datasets that don't need this (MHR).
+        self.align_matrix = align_matrix
 
         self.trans: npt.NDArray[np.floating[Any]] = np.array([0.0, 0.0, 0.0])
         self.scale: float = 1.0
@@ -85,6 +94,8 @@ class Camera:
         self.rots = self.rots.to(self.data_device)
         self.Jtrs = self.Jtrs.to(self.data_device)
         self.bone_transforms = self.bone_transforms.to(self.data_device)
+        if self.align_matrix is not None:
+            self.align_matrix = self.align_matrix.to(self.data_device)
 
     def copy(self) -> Camera:
         return copy_module.copy(self)
