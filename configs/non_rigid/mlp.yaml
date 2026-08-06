@@ -9,8 +9,8 @@ model:
       scale_offset: logit
       rot_offset: mult
 
-      delay: 3000
-#      delay: 0
+      # delay: 3000
+      delay: 0
 
       feature_dim: ${model.texture.non_rigid_dim}
       latent_dim: 0

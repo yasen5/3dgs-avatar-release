@@ -27,7 +27,11 @@ from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 from src.body_models import mhr_lbs
 from src.body_models.base import BodyModel
 from src.body_models.mhr_lbs import MHRQueryOutput
-from src.constants import MHR_HAND_DIMS, MHR_HAND_DIMS_LEFT, MHR_HAND_DIMS_RIGHT
+from src.constants import (
+    MHR_HAND_DIMS,
+    MHR_HAND_DIMS_LEFT,
+    MHR_HAND_DIMS_RIGHT,
+)
 
 
 NUM_MHR_SHAPE_PARAMS = 45

@@ -209,7 +209,7 @@ class BodyModel(ABC):
 
         The fixed body/arm pose continues to position the hand correctly;
         optimizers can only change the backend-declared hand degrees of
-        freedom.
+        freedom (see hand_pose_parameter_mask).
         """
         mask = self.hand_pose_parameter_mask().to(pose_params.device)
         if mask.shape != (pose_params.shape[-1],):

@@ -222,6 +222,28 @@ class HashGridwithMLP(NonRigidDeform):
             self.frame_dict = metadata['frame_dict']
             self.latent = nn.Embedding(len(self.frame_dict), self.latent_dim)
 
+        # Small FFN encoding each frame's raw MHR hand pose DOFs (per
+        # body_model.hand_pose_parameter_mask(), so it respects hand_side)
+        # concatenated with the (per-subject constant) shape params -- a
+        # targeted signal for the deformer to key corrections off of,
+        # distinct from HierarchicalPoseEncoder's derived joint-transform
+        # features above. Reads the same frame_dict as the latent code.
+        self.hand_encoder_dim: int = cfg.get('hand_encoder_dim', 0)
+        if self.hand_encoder_dim > 0:
+            d_cond += self.hand_encoder_dim
+            self.frame_dict = metadata['frame_dict']
+            body_model = metadata['body_model']
+            self.register_buffer('hand_pose_mask', body_model.hand_pose_parameter_mask())
+            self.register_buffer('hand_encoder_model_params', metadata['model_params_all'])
+            self.register_buffer('hand_encoder_shape_params', metadata['shape_params_all'])
+            hand_in_dim = int(self.hand_pose_mask.sum()) + self.hand_encoder_shape_params.shape[-1]
+            hidden_dim = int(cfg.get('hand_encoder_hidden_dim', 64))
+            self.hand_encoder = nn.Sequential(
+                nn.Linear(hand_in_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, self.hand_encoder_dim),
+            )
+
         d_out = GAUSSIAN_XYZ_DIM + GAUSSIAN_SCALE_DIM + GAUSSIAN_ROT_DIM
         self.feature_dim: int = cfg.feature_dim
         d_out += self.feature_dim
@@ -231,6 +253,19 @@ class HashGridwithMLP(NonRigidDeform):
         self.mlp = VanillaCondMLP(self.hashgrid.n_output_dims, d_cond, d_out, cfg.mlp)
 
         self.delay: int = cfg.delay
+
+    def _frame_indices(self, frame_ids: list[str], device: torch.device) -> torch.Tensor:
+        idxs = [
+            self.frame_dict[fid] if fid in self.frame_dict else len(self.frame_dict) - 1
+            for fid in frame_ids
+        ]
+        return torch.tensor(idxs, device=device).long()
+
+    def _hand_encoding(self, idx: torch.Tensor) -> torch.Tensor:
+        """(B, hand_encoder_dim) encoding of each frame's raw hand pose DOFs + shape."""
+        hand_pose = self.hand_encoder_model_params[idx][:, self.hand_pose_mask]
+        shape = self.hand_encoder_shape_params[idx]
+        return self.hand_encoder(torch.cat([hand_pose, shape], dim=1))
 
     def forward(
         self, gaussians: GaussianModel, iteration: int, camera: Camera, compute_loss: bool = True
@@ -257,6 +292,11 @@ class HashGridwithMLP(NonRigidDeform):
             latent_code = self.latent(latent_idx)
             latent_code = latent_code.expand(pose_feat.shape[0], -1)
             pose_feat = torch.cat([pose_feat, latent_code], dim=1)
+
+        if self.hand_encoder_dim > 0:
+            idx = self._frame_indices([camera.frame_id], pose_feat.device)
+            hand_feat = self._hand_encoding(idx).expand(pose_feat.shape[0], -1)
+            pose_feat = torch.cat([pose_feat, hand_feat], dim=1)
 
         xyz = gaussians.get_xyz
         xyz_norm = self.aabb.normalize(xyz, sym=True)
@@ -338,13 +378,14 @@ class HashGridwithMLP(NonRigidDeform):
         pose_feat = self.pose_encoder(rots, Jtrs)                 # (B, d_pose)
 
         if self.latent_dim > 0:
-            idxs = [
-                self.frame_dict[cam.frame_id] if cam.frame_id in self.frame_dict else len(self.frame_dict) - 1
-                for cam in cameras
-            ]
-            latent_idx = torch.tensor(idxs, device=pose_feat.device).long()
+            latent_idx = self._frame_indices([cam.frame_id for cam in cameras], pose_feat.device)
             latent_code = self.latent(latent_idx)                 # (B, latent_dim)
             pose_feat = torch.cat([pose_feat, latent_code], dim=1)
+
+        if self.hand_encoder_dim > 0:
+            hand_idx = self._frame_indices([cam.frame_id for cam in cameras], pose_feat.device)
+            hand_feat = self._hand_encoding(hand_idx)              # (B, hand_encoder_dim)
+            pose_feat = torch.cat([pose_feat, hand_feat], dim=1)
 
         xyz = gaussians.get_xyz
         N = xyz.shape[0]

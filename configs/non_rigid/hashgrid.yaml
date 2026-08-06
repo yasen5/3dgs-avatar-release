@@ -9,10 +9,17 @@ model:
       scale_offset: logit
       rot_offset: mult
 
-      delay: 3000
+      delay: 0
 
       feature_dim: ${model.texture.non_rigid_dim}
       latent_dim: 0
+      # Opt-in FFN encoding each frame's raw MHR hand pose DOFs + shape
+      # params, concatenated into the deformer's conditioning vector
+      # alongside the pose encoder output and latent code (see
+      # HashGridwithMLP._hand_encoding in src/models/deformer/non_rigid.py).
+      # 0 disables it entirely (default, matches prior runs).
+      hand_encoder_dim: 0
+      hand_encoder_hidden_dim: 64
       pose_encoder:
         num_joints: 127
         rel_joints: false

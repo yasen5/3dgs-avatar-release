@@ -12,8 +12,6 @@ model:
       resolution: 128
       channels: 32
     face:
-      # Paper doesn't give an explicit face-triplane resolution beyond
-      # "higher-resolution"; 256 is our choice, not from the paper.
       resolution: 256
       channels: 32
 
