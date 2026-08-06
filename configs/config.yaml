@@ -41,13 +41,33 @@ dataset:
   source_layout: prepared
 
   # DataLoader parallelism for the train split (see scripts/train.py). 0 keeps
-  # loading in the main process (original behavior); >0 loads/prefetches in
-  # background worker subprocesses to overlap CPU image decode with GPU work.
-  # 2 captures the full observed speedup in sweeps (see PR/commit notes); more
-  # workers cost linearly more host RAM (each is a forked copy holding the
-  # precomputed per-frame pose tensors + mesh data) without further gains.
-  num_workers: 2
-  batch_size: 1
+  # loading in the main process; >0 loads/prefetches in background worker
+  # subprocesses to overlap CPU image decode with GPU work. Since render_batch
+  # (src/gaussian_renderer) moved to gsplat's real batched rasterization, GPU
+  # work now scales with batch_size in a single kernel launch instead of a
+  # per-view Python loop, so batch_size is the actual parallelism knob;
+  # num_workers just needs to keep the CPU-side image/mask decode ahead of it.
+  # Measured on this box (RTX 4070, 12GB VRAM, 16 cores / 15GB system RAM) via
+  # `nvidia-smi --query-gpu=utilization.gpu` sampled every 1s over a 150s
+  # steady-state window:
+  #   batch=1, workers=2  (old default): well under 80% GPU util
+  #   batch=4, workers=4:  ~83% avg GPU util, ~5.3GB VRAM -- meets the >=80%
+  #     target with headroom on both VRAM and host RAM.
+  #   batch=8, workers=8:  ~79% avg GPU util (*lower*, not higher) -- the
+  #     per-view Python loop in scripts/train.py (LPIPS foreground-crop's
+  #     cam.original_mask.cpu().numpy()/np.where, aiap loss, mask loss) is
+  #     still O(n_views) serial CPU work per iteration, so doubling batch_size
+  #     doubles that serial overhead even though the GPU render itself is one
+  #     batched call -- net effect is more GPU idle time, not less.
+  #   batch=8, workers=16: OOM-killed within ~30s (each worker is a forked
+  #     copy holding the precomputed per-frame pose tensors + mesh data --
+  #     15GB total system RAM cannot sustain 16 of them).
+  # Don't raise num_workers past batch_size on this host, and don't raise
+  # batch_size further without first vectorizing the per-view Python loop
+  # in scripts/train.py -- it, not the renderer or the data loader, is now
+  # the bottleneck to further GPU saturation.
+  num_workers: 4
+  batch_size: 4
 
   mode: ${mode}
   test_mode: view

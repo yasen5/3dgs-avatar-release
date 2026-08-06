@@ -605,7 +605,18 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor: torch.Tensor, update_filter: torch.Tensor) -> None:
+    def add_densification_stats(
+        self, viewspace_point_tensor: torch.Tensor, update_filter: torch.Tensor, batch_idx: int | None = None
+    ) -> None:
         assert viewspace_point_tensor.grad is not None
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        # batch_idx is set when viewspace_point_tensor is gsplat's batched
+        # means2d (shared across every view in a render_batch() call, shape
+        # (B,1,N,2)) -- its .grad only gets populated on this exact object
+        # (see render_batch's docstring), so the per-view (N,2) slice has to
+        # be taken from the grad *after* backward, not before.
+        grad = viewspace_point_tensor.grad
+        if batch_idx is not None:
+            grad = grad[batch_idx]
+        grad = grad.reshape(-1, grad.shape[-1])
+        self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter, :2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1

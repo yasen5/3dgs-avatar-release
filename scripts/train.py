@@ -12,7 +12,10 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from random import randint
 from typing import TypedDict, cast
@@ -37,7 +40,7 @@ from src.constants import (
     TRAIN_VAL_SUBSAMPLE_STRIDE,
 )
 from src.dataset.training_interface import crop_hand_regions
-from src.gaussian_renderer import render
+from src.gaussian_renderer import render, render_batch
 from src.scene import GaussianModel, Scene
 from src.utils.general_utils import PSEvaluator
 from src.utils.general_utils import fix_random
@@ -86,7 +89,67 @@ def retrieve_scheduled_value(iteration: int, value: float | int | ListConfig) ->
             break
     return float(value_list[i - 1])
 
-def training(config: DictConfig) -> None:
+
+class TrainingDiagnostics:
+    """Small, dependency-free, flushed diagnostics sink for each run.
+
+    W&B may be disabled or may only be readable after a run finishes. These
+    files are deliberately plain text so an early failure still leaves useful
+    metrics on disk while the process is running:
+
+    * ``train.log``: human-readable one-line events;
+    * ``metrics.jsonl``: one JSON object per training step/validation event.
+    """
+
+    def __init__(self, exp_dir: str | os.PathLike[str]) -> None:
+        exp_path = Path(exp_dir)
+        self.log_path = exp_path / "train.log"
+        self.metrics_path = exp_path / "metrics.jsonl"
+        # Line buffering plus explicit flush keeps both files useful if the
+        # process is killed or crashes before the next validation interval.
+        self._log = self.log_path.open("a", encoding="utf-8", buffering=1)
+        self._metrics = self.metrics_path.open("a", encoding="utf-8", buffering=1)
+
+    def write(self, event: str, **fields: object) -> None:
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **fields,
+        }
+        self._metrics.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+        self._metrics.flush()
+
+        iteration = fields.get("iteration", "-")
+        if event == "train":
+            line = (
+                f"[{record['timestamp']}] [ITER {iteration}] train "
+                f"loss={fields.get('loss_total')} ema_loss={fields.get('ema_loss')} "
+                f"iter_ms={fields.get('iter_time_ms')} points={fields.get('num_points')}"
+            )
+        elif event == "validation":
+            line = (
+                f"[{record['timestamp']}] [ITER {iteration}] "
+                f"{fields.get('split')} L1={fields.get('l1')} "
+                f"PSNR={fields.get('psnr')} SSIM={fields.get('ssim')} "
+                f"LPIPS={fields.get('lpips')} cameras={fields.get('num_cameras')}"
+            )
+        elif event == "failure":
+            line = f"[{record['timestamp']}] FAILURE: {fields.get('error')}"
+        else:
+            line = f"[{record['timestamp']}] {event} {fields}"
+        self._log.write(line + "\n")
+        if event == "failure" and fields.get("traceback"):
+            self._log.write(str(fields["traceback"]))
+            if not str(fields["traceback"]).endswith("\n"):
+                self._log.write("\n")
+        self._log.flush()
+
+    def close(self) -> None:
+        self._metrics.close()
+        self._log.close()
+
+
+def training(config: DictConfig, diagnostics: TrainingDiagnostics) -> None:
     model = config.model
     dataset = config.dataset
     opt = config.opt
@@ -191,22 +254,23 @@ def training(config: DictConfig) -> None:
         use_normal = lambda_normal > 0. and hasattr(scene.train_dataset, 'load_normal_map')
         use_depth = (lambda_depth_local > 0. or lambda_depth_global > 0.) and hasattr(scene.train_dataset, 'load_depth_map')
 
-        # NOTE: multi-stream concurrent rendering was tried here (each view on
-        # its own torch.cuda.Stream) and reverted -- diff_gaussian_rasterization
-        # holds internal scratch-buffer state that isn't safe across concurrent
-        # streams: it reproducibly returned NaN gradients from
+        # NOTE: multi-stream concurrent rendering was tried here previously
+        # (each view on its own torch.cuda.Stream) and reverted --
+        # diff_gaussian_rasterization hardcodes CUDA's legacy default stream
+        # for every kernel/CUB call and has a blocking cudaMemcpy in its
+        # forward pass, so concurrent per-view streams corrupted its
+        # scratch-buffer state and produced NaN gradients from
         # _RasterizeGaussiansBackward as soon as two views' forward passes
-        # overlapped (confirmed with detect_anomaly=true, independent of
-        # num_workers). Views are therefore rendered sequentially on the
-        # default stream; the real gain here is the multi-view loss batching
-        # below (one combined backward+optimizer step per `batch_size` views)
-        # rather than concurrent GPU execution.
-        render_pkgs = [
-            render(cam, iteration, scene, pipe, background, compute_loss=True,
-                   return_opacity=use_mask or need_hand_target,
-                   return_normal=use_normal, return_depth=use_depth)
-            for cam in cams
-        ]
+        # overlapped. render_batch() (src/gaussian_renderer) replaces that
+        # backend with gsplat, which exposes a real batched kernel: all
+        # `batch_size` views are rasterized together in ONE call instead of
+        # a Python loop over per-view calls, so there's no stream-concurrency
+        # hazard to route around at all.
+        render_pkgs = render_batch(
+            cams, iteration, scene, pipe, background, compute_loss=True,
+            return_opacity=use_mask or need_hand_target,
+            return_normal=use_normal, return_depth=use_depth,
+        )
 
         # Loss (averaged over the batch of views rendered above)
         lambda_l1 = retrieve_scheduled_value(iteration, config.opt.lambda_l1)
@@ -270,10 +334,11 @@ def training(config: DictConfig) -> None:
                         fg_image, gt_fg_image, normalize=True
                     ).mean()
 
-        viewspace_point_tensors, visibility_filters, radii_list = [], [], []
+        viewspace_point_tensors, viewspace_batch_idxs, visibility_filters, radii_list = [], [], [], []
         for cam, render_pkg in zip(cams, render_pkgs):
             image = render_pkg["render"]
             viewspace_point_tensors.append(render_pkg["viewspace_points"])
+            viewspace_batch_idxs.append(render_pkg["viewspace_batch_idx"])
             visibility_filters.append(render_pkg["visibility_filter"])
             radii_list.append(render_pkg["radii"])
             opacity = render_pkg["opacity_render"] if use_mask else None
@@ -373,6 +438,15 @@ def training(config: DictConfig) -> None:
 
             # Progress bar
             ema_loss_for_log = LOSS_EMA_ALPHA * loss.item() + (1 - LOSS_EMA_ALPHA) * ema_loss_for_log
+            diagnostics.write(
+                "train",
+                iteration=iteration,
+                loss_total=float(loss.item()),
+                ema_loss=float(ema_loss_for_log),
+                iter_time_ms=float(elapsed),
+                num_points=int(gaussians.get_xyz.shape[0]),
+                loss_finite=bool(torch.isfinite(loss)),
+            )
             if iteration % PROGRESS_BAR_UPDATE_INTERVAL == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{PROGRESS_BAR_PRECISION}f}"})
                 progress_bar.update(PROGRESS_BAR_UPDATE_INTERVAL)
@@ -380,7 +454,10 @@ def training(config: DictConfig) -> None:
                 progress_bar.close()
 
             # Log and save
-            validation(iteration, testing_iterations, testing_interval, scene, evaluator, (pipe, background))
+            validation(
+                iteration, testing_iterations, testing_interval, scene, evaluator,
+                (pipe, background), diagnostics,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -388,9 +465,11 @@ def training(config: DictConfig) -> None:
             # Densification
             if iteration < opt.densify_until_iter and iteration > model.gaussian.delay:
                 # Keep track of max radii in image-space for pruning
-                for vp, vf, rad in zip(viewspace_point_tensors, visibility_filters, radii_list):
+                for vp, b_idx, vf, rad in zip(
+                    viewspace_point_tensors, viewspace_batch_idxs, visibility_filters, radii_list
+                ):
                     gaussians.max_radii2D[vf] = torch.max(gaussians.max_radii2D[vf], rad[vf])
-                    gaussians.add_densification_stats(vp, vf)
+                    gaussians.add_densification_stats(vp, vf, batch_idx=b_idx)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = opt.densify_screen_size_threshold if iteration > opt.opacity_reset_interval else None
@@ -425,6 +504,7 @@ def validation(
     scene: Scene,
     evaluator: PSEvaluator,
     renderArgs: tuple[DictConfig, torch.Tensor],
+    diagnostics: TrainingDiagnostics,
 ) -> None:
     # Report test and samples of training set
     if testing_interval > 0:
@@ -493,7 +573,18 @@ def validation(
             ssim_test /= len(val_config['cameras'])
             lpips_test /= len(val_config['cameras'])
             l1_test /= len(val_config['cameras'])
-            print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, val_config['name'], l1_test, psnr_test))
+            print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, val_config['name'], l1_test, psnr_test), flush=True)
+            diagnostics.write(
+                "validation",
+                iteration=iteration,
+                split=val_config['name'],
+                l1=float(l1_test.item()),
+                psnr=float(psnr_test.item()),
+                ssim=float(ssim_test.item()),
+                lpips=float(lpips_test.item()),
+                num_cameras=len(val_config['cameras']),
+                num_points=int(scene.gaussians.get_xyz.shape[0]),
+            )
             wandb.log({
                 val_config['name'] + '/loss_viewpoint - l1_loss': l1_test,
                 val_config['name'] + '/loss_viewpoint - psnr': psnr_test,
@@ -508,6 +599,13 @@ def validation(
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config: DictConfig) -> None:
+    # Make ordinary diagnostic prints visible promptly when stdout is piped
+    # through a terminal multiplexer or tee. The structured diagnostics below
+    # are independently flushed to disk as well.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(line_buffering=True)
     print(OmegaConf.to_yaml(config))
     OmegaConf.set_struct(config, False) # allow adding new values to config
 
@@ -516,29 +614,53 @@ def main(config: DictConfig) -> None:
     OmegaConf.save(config, os.path.join(config.exp_dir, "config.yaml"))
     config.checkpoint_iterations.append(config.opt.iterations)
 
-    # set wandb logger
-    wandb_name = config.name
-    wandb.init(
-        mode="disabled" if config.wandb_disable else None,
-        name=wandb_name,
-        project='gaussian-splatting-avatar',
-        entity='fast-avatar',
-        dir=config.exp_dir,
-        config=cast("dict[str, object]", OmegaConf.to_container(config, resolve=True)),
-        settings=wandb.Settings(start_method='fork'),
+    diagnostics = TrainingDiagnostics(config.exp_dir)
+    diagnostics.write(
+        "run_start",
+        pid=os.getpid(),
+        exp_dir=str(Path(config.exp_dir).resolve()),
+        iterations=int(config.opt.iterations),
+        test_interval=int(config.test_interval),
+        batch_size=int(config.dataset.get("batch_size", 1)),
+        num_workers=int(config.dataset.get("num_workers", 0)),
+        cuda_available=bool(torch.cuda.is_available()),
+        cuda_device=(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
+        torch_version=torch.__version__,
     )
 
-    print("Optimizing " + config.exp_dir)
+    try:
+        # set wandb logger
+        wandb_name = config.name
+        wandb.init(
+            mode="disabled" if config.wandb_disable else None,
+            name=wandb_name,
+            project='gaussian-splatting-avatar',
+            entity='fast-avatar',
+            dir=config.exp_dir,
+            config=cast("dict[str, object]", OmegaConf.to_container(config, resolve=True)),
+            settings=wandb.Settings(start_method='fork'),
+        )
 
-    # Initialize system state (RNG)
-    fix_random(config.seed)
+        print("Optimizing " + config.exp_dir, flush=True)
 
-    # Start GUI server, configure and run training
-    torch.autograd.set_detect_anomaly(config.detect_anomaly)
-    training(config)
+        # Initialize system state (RNG)
+        fix_random(config.seed)
 
-    # All done
-    print("\nTraining complete.")
+        # Start GUI server, configure and run training
+        torch.autograd.set_detect_anomaly(config.detect_anomaly)
+        training(config, diagnostics)
+
+        diagnostics.write("run_complete", iteration=int(config.opt.iterations))
+        print("\nTraining complete.", flush=True)
+    except Exception as exc:
+        diagnostics.write(
+            "failure",
+            error=repr(exc),
+            traceback=traceback.format_exc(),
+        )
+        raise
+    finally:
+        diagnostics.close()
 
 
 if __name__ == "__main__":
