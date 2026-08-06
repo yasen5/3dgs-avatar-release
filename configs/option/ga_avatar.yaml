@@ -50,9 +50,6 @@ model:
     # create_from_pcd seeds is a fixed, unused initialization.
     delay: 100000000
 
-pipeline:
-  pose_noise: 0.0  # GA-Avatar holds pose fixed; no reason to jitter camera.rots
-
 test_interval: 2000
 save_iterations: [12000]
 # Periodic checkpoints (in addition to the automatic one at the final

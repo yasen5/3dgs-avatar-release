@@ -118,9 +118,6 @@ pipeline:
   compute_cov3D_python: true
   debug: false
 
-  pose_noise: 0.1
-  pose_noise_apply_prob: 0.5
-
 debug_from: -1
 detect_anomaly: false
 test_iterations: []

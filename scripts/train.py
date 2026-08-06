@@ -36,6 +36,7 @@ from src.constants import (
     PROGRESS_BAR_UPDATE_INTERVAL,
     TRAIN_VAL_SUBSAMPLE_STRIDE,
 )
+from src.dataset.training_interface import crop_hand_regions
 from src.gaussian_renderer import render
 from src.scene import GaussianModel, Scene
 from src.utils.general_utils import PSEvaluator
@@ -197,6 +198,46 @@ def training(config: DictConfig) -> None:
         loss_depth_global = torch.zeros((), device="cuda")
         loss_reg_sums: dict[str, torch.Tensor] = {}
 
+        hand_only = bool(getattr(scene.train_dataset, "hand_only", False))
+        if hand_only:
+            metric_images, metric_targets = crop_hand_regions(
+                [pkg["render"] for pkg in render_pkgs],
+                [cam.original_image.cuda() for cam in cams],
+                [cam.original_mask for cam in cams],
+                padding=float(getattr(scene.train_dataset, "hand_crop_padding", 0.25)),
+            )
+        else:
+            metric_images = torch.stack([pkg["render"] for pkg in render_pkgs])
+            metric_targets = torch.stack([cam.original_image.cuda() for cam in cams])
+
+        # L1 and SSIM use the same region: hand crops for hand-only training,
+        # otherwise the complete rendered views.
+        if lambda_l1 > 0.:
+            loss_l1 = l1_loss(metric_images, metric_targets)
+        if lambda_dssim > 0.:
+            loss_dssim = 1.0 - ssim(metric_images, metric_targets)
+
+        # LPIPS uses hand crops in hand-only mode.  For the regular model it
+        # remains restricted to the foreground mask's bounding box.
+        if lambda_perceptual > 0.:
+            if hand_only:
+                loss_perceptual = loss_fn_vgg(
+                    metric_images, metric_targets, normalize=True
+                ).mean()
+            elif not hand_only:
+                for cam, render_pkg in zip(cams, render_pkgs):
+                    image = render_pkg["render"]
+                    gt_image = cam.original_image.cuda()
+                    mask = cam.original_mask.cpu().numpy()
+                    mask_idx = np.where(mask)
+                    y1, y2 = mask_idx[1].min(), mask_idx[1].max() + 1
+                    x1, x2 = mask_idx[2].min(), mask_idx[2].max() + 1
+                    fg_image = image[:, y1:y2, x1:x2]
+                    gt_fg_image = gt_image[:, y1:y2, x1:x2]
+                    loss_perceptual = loss_perceptual + loss_fn_vgg(
+                        fg_image, gt_fg_image, normalize=True
+                    ).mean()
+
         viewspace_point_tensors, visibility_filters, radii_list = [], [], []
         for cam, render_pkg in zip(cams, render_pkgs):
             image = render_pkg["render"]
@@ -204,23 +245,6 @@ def training(config: DictConfig) -> None:
             visibility_filters.append(render_pkg["visibility_filter"])
             radii_list.append(render_pkg["radii"])
             opacity = render_pkg["opacity_render"] if use_mask else None
-
-            gt_image = cam.original_image.cuda()
-
-            if lambda_l1 > 0.:
-                loss_l1 = loss_l1 + l1_loss(image, gt_image)
-            if lambda_dssim > 0.:
-                loss_dssim = loss_dssim + (1.0 - ssim(image, gt_image))
-
-            if lambda_perceptual > 0:
-                # crop the foreground
-                mask = cam.original_mask.cpu().numpy()
-                mask_idx = np.where(mask)
-                y1, y2 = mask_idx[1].min(), mask_idx[1].max() + 1
-                x1, x2 = mask_idx[2].min(), mask_idx[2].max() + 1
-                fg_image = image[:, y1:y2, x1:x2]
-                gt_fg_image = gt_image[:, y1:y2, x1:x2]
-                loss_perceptual = loss_perceptual + loss_fn_vgg(fg_image, gt_fg_image, normalize=True).mean()
 
             gt_mask = cam.original_mask.cuda()
             if use_mask:
@@ -259,9 +283,8 @@ def training(config: DictConfig) -> None:
                 loss_reg_sums[name] = loss_reg_sums.get(name, torch.zeros((), device="cuda")) + value
 
         n_views = len(cams)
-        loss_l1 = loss_l1 / n_views
-        loss_dssim = loss_dssim / n_views
-        loss_perceptual = loss_perceptual / n_views
+        if not hand_only:
+            loss_perceptual = loss_perceptual / n_views
         loss_mask = loss_mask / n_views
         loss_aiap_xyz = loss_aiap_xyz / n_views
         loss_aiap_cov = loss_aiap_cov / n_views
@@ -412,8 +435,16 @@ def validation(
                     data.image_name))
                 examples.append(wandb_img)
 
-                l1_test += l1_loss(image, gt_image).mean().double()
-                metrics_test = evaluator(image, gt_image)
+                eval_dataset = getattr(scene, val_config['name'] + '_dataset')
+                if bool(getattr(eval_dataset, "hand_only", False)):
+                    eval_image, eval_target = crop_hand_regions(
+                        [image], [gt_image], [data.original_mask],
+                        padding=float(getattr(eval_dataset, "hand_crop_padding", 0.25)),
+                    )
+                else:
+                    eval_image, eval_target = image, gt_image
+                l1_test += l1_loss(eval_image, eval_target).mean().double()
+                metrics_test = evaluator(eval_image, eval_target)
                 psnr_test += metrics_test["psnr"]
                 ssim_test += metrics_test["ssim"]
                 lpips_test += metrics_test["lpips"]

@@ -39,6 +39,7 @@ from src.body_models.mhr_body_model import MHRBodyModel
 from src.body_models.metadata import CanonicalMetadata, ModelMetadata
 from src.body_models.mhr_utils import build_big_pose_model_params, local_joint_rotmats
 from src.constants import CAMERAS_EXTENT, MHR_MODEL_PARAMS_DIM, MHR_SHAPE_DIM
+from src.dataset.training_interface import is_hand_dataset
 from src.scene.cameras import Camera
 from src.utils.dataset_utils import AABB, fetchPly, storePly
 from src.utils.graphics_utils import BasicPointCloud, focal2fov
@@ -85,6 +86,12 @@ class MHRNativeDataset(Dataset[Camera]):
         self.cfg = cfg
         self.split = split
         self.root_dir: str = cfg.root_dir
+        configured_hand_only = cfg.get("hand_only", None)
+        self.hand_only = is_hand_dataset(
+            self.root_dir,
+            None if configured_hand_only is None else bool(configured_hand_only),
+        )
+        self.hand_crop_padding = float(cfg.get("hand_crop_padding", 0.25))
         self.white_bg: bool = cfg.white_background
         self.device: str = cfg.mhr_device
         self.source_layout: str = cfg.source_layout
@@ -131,6 +138,7 @@ class MHRNativeDataset(Dataset[Camera]):
             model=self.mhr_model,
             state_dict=state_dict,
         )
+        self.body_model.set_hand_only(self.hand_only)
         self.faces = self.body_model.faces()
         self.dense_skinning_weights = self.body_model.skinning_weights().numpy()
         self.joint_parents = torch.from_numpy(self.body_model.joint_parents())
@@ -267,7 +275,10 @@ class MHRNativeDataset(Dataset[Camera]):
             raise FileNotFoundError(f"No MHR raw fits found in {raw_dir}")
 
         image_dir = os.path.join(self.camera_dir, 'images')
-        mask_dir = os.path.join(self.camera_dir, str(self.cfg.mask_dir))
+        mask_dir = os.path.join(
+            self.camera_dir,
+            "hand_masks" if self.hand_only else str(self.cfg.mask_dir),
+        )
         frame_ids: list[str] = []
         shape_params: list[npt.NDArray[np.floating[Any]]] = []
         model_params: list[npt.NDArray[np.floating[Any]]] = []
@@ -374,7 +385,7 @@ class MHRNativeDataset(Dataset[Camera]):
             big_shape = shape_params_all[0:1].to(self.device)
             big_model_params = build_big_pose_model_params(model_params_all[0]).unsqueeze(0).to(self.device)
             big_out = mhr_lbs.mhr_query(self.mhr_model, big_shape, big_model_params, device=self.device)
-        big_pose_verts = big_out["verts"][0].cpu().numpy().astype(np.float32)  # (18439,3)
+        big_pose_verts = self.body_model.rest_vertices().detach().cpu().numpy().astype(np.float32)
         big_pose_joint_pos = big_out["joint_pos"][0].cpu()  # (127,3)
         big_pose_joint_rotmat = big_out["joint_rotmat"][0].cpu()  # (127,3,3)
 
@@ -413,6 +424,9 @@ class MHRNativeDataset(Dataset[Camera]):
             'body_model': self.body_model,
             'face_vertex_mask': self.body_model.face_region_mask(),
             'laplacian': self.body_model.laplacian(cano_mesh),
+            'hand_only': self.hand_only,
+            'hand_crop_padding': self.hand_crop_padding,
+            'hand_joint_mask': self.body_model.hand_joint_mask(),
         }
 
         if self.split != 'train':
@@ -530,6 +544,13 @@ class MHRNativeDataset(Dataset[Camera]):
         return torch.from_numpy(depth).unsqueeze(0).float()
 
     def readPointCloud(self) -> BasicPointCloud:
+        if self.hand_only:
+            xyz = np.asarray(self.metadata['cano_verts'], dtype=np.float32)
+            return BasicPointCloud(
+                points=xyz,
+                colors=np.ones_like(xyz, dtype=np.float32),
+                normals=np.zeros_like(xyz, dtype=np.float32),
+            )
         ply_path = os.path.join(self.root_dir, 'cano_mhr.ply')
         try:
             pcd = fetchPly(ply_path)

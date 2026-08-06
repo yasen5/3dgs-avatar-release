@@ -86,6 +86,7 @@ class SMPLXBodyModel(BodyModel, nn.Module):
         self._subdiv_lbs_weights: torch.Tensor  # (V_hi, n_joints)
         self._subdiv_v_template: torch.Tensor  # (V_hi, 3)
         self._face_region_mask: npt.NDArray[np.bool_]
+        self._hand_joint_grad_hook: torch.utils.hooks.RemovableHandle | None = None
 
     def build_canonical_mesh(
         self,
@@ -159,22 +160,47 @@ class SMPLXBodyModel(BodyModel, nn.Module):
         self._assert_built()
         assert self.face_offset is not None
         shape_offset = torch.einsum("vcb,b->vc", self._subdiv_shapedirs, self.beta[0])
-        return self._subdiv_v_template + shape_offset + self.face_offset
+        vertices = self._subdiv_v_template + shape_offset + self.face_offset
+        return vertices[self.hand_vertex_mask().to(vertices.device)] if self.hand_only else vertices
 
     def faces(self) -> npt.NDArray[np.integer[Any]]:
         self._assert_built()
-        return self._cano_faces
+        return self.select_vertex_faces(self._cano_faces, self.hand_vertex_mask()) if self.hand_only else self._cano_faces
 
     def skinning_weights(self) -> torch.Tensor:
         self._assert_built()
-        return self._subdiv_lbs_weights
+        return self._subdiv_lbs_weights[self.hand_vertex_mask()] if self.hand_only else self._subdiv_lbs_weights
 
     def joint_parents(self) -> npt.NDArray[np.integer[Any]]:
         return np.asarray(self.model.parents.detach().cpu().numpy(), dtype=np.int64)
 
     def face_region_mask(self) -> npt.NDArray[np.bool_]:
         self._assert_built()
-        return self._face_region_mask
+        return self._face_region_mask[self.hand_vertex_mask().cpu().numpy()] if self.hand_only else self._face_region_mask
+
+    def hand_vertex_mask(self) -> torch.Tensor:
+        self._assert_built()
+        # SMPL-X: body wrists are joints 20/21 and articulated fingers are
+        # joints 25..54 (22..24 are jaw/eyes).
+        hand_joints = [20, 21, *range(25, 55)]
+        return self._subdiv_lbs_weights[:, hand_joints].sum(dim=1) >= 0.5
+
+    def hand_pose_parameter_mask(self) -> torch.Tensor:
+        n_joints = int(self.model.parents.shape[0])
+        mask = torch.zeros(n_joints, 3, dtype=torch.bool)
+        mask[[20, 21, *range(25, 55)]] = True
+        return mask.reshape(-1)
+
+    def hand_joint_mask(self) -> torch.Tensor:
+        return self.hand_pose_parameter_mask().reshape(-1, 3).any(dim=1)
+
+    def set_hand_only(self, enabled: bool = True) -> None:
+        super().set_hand_only(enabled)
+        if enabled and self._hand_joint_grad_hook is None:
+            joint_mask = self.hand_joint_mask()
+            self._hand_joint_grad_hook = self.joint_offset.register_hook(
+                lambda grad: grad * joint_mask.to(device=grad.device, dtype=grad.dtype).unsqueeze(1)
+            )
 
     def pose_transforms(self, pose_params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """pose_params: (B, n_joints*3) full SMPL-X axis-angle pose (root

@@ -55,6 +55,7 @@ from torch.utils.data import Dataset
 
 from src.body_models import get_body_model
 from src.body_models.metadata import CanonicalMetadata, ModelMetadata
+from src.dataset.training_interface import is_hand_dataset
 from src.utils.dataset_utils import AABB, fetchPly, storePly
 from src.utils.graphics_utils import BasicPointCloud, focal2fov
 
@@ -160,6 +161,12 @@ class NeumanSMPLXDataset(Dataset[Camera]):
         self.cfg = cfg
         self.split = split
         self.root_dir: str = cfg.root_dir
+        configured_hand_only = cfg.get("hand_only", None)
+        self.hand_only = is_hand_dataset(
+            self.root_dir,
+            None if configured_hand_only is None else bool(configured_hand_only),
+        )
+        self.hand_crop_padding = float(cfg.get("hand_crop_padding", 0.25))
         self.white_bg: bool = cfg.get("white_background", False)
         self.data_device: str = cfg.get("data_device", "cuda")
 
@@ -201,6 +208,7 @@ class NeumanSMPLXDataset(Dataset[Camera]):
             n_subdivisions=int(cfg.body_model.get("n_subdivisions", 2)),
             face_region_init=face_region_init,
         )
+        self.body_model.set_hand_only(self.hand_only)
 
         joint_offset_path = os.path.join(self.root_dir, "smplx_optimized", "joint_offset.json")
         self.joint_offset_gt: torch.Tensor
@@ -215,7 +223,9 @@ class NeumanSMPLXDataset(Dataset[Camera]):
         self.get_metadata()
 
         self._image_dir = os.path.join(self.root_dir, "images")
-        self._mask_dir = os.path.join(self.root_dir, "masks")
+        self._mask_dir = os.path.join(
+            self.root_dir, "hand_masks" if self.hand_only else "masks"
+        )
         # Sapiens-precomputed geometric supervision (GA-Avatar's L_geo). Not
         # part of the ExAvatar preprocessing this dataset otherwise reads --
         # generated separately (see skills/ or the plan doc's data-prep
@@ -332,6 +342,9 @@ class NeumanSMPLXDataset(Dataset[Camera]):
             "body_model": self.body_model,
             "face_vertex_mask": self.body_model.face_region_mask(),
             "laplacian": self.body_model.laplacian(cano_mesh),
+            "hand_only": self.hand_only,
+            "hand_crop_padding": self.hand_crop_padding,
+            "hand_joint_mask": self.body_model.hand_joint_mask(),
         }
 
         if self.split != "train":
@@ -429,6 +442,13 @@ class NeumanSMPLXDataset(Dataset[Camera]):
         return RawFrameDataset(self)
 
     def readPointCloud(self) -> BasicPointCloud:
+        if self.hand_only:
+            xyz = np.asarray(self.metadata["cano_verts"], dtype=np.float32)
+            return BasicPointCloud(
+                points=xyz,
+                colors=np.ones_like(xyz, dtype=np.float32),
+                normals=np.zeros_like(xyz, dtype=np.float32),
+            )
         ply_path = os.path.join(self.root_dir, "cano_smplx.ply")
         try:
             pcd = fetchPly(ply_path)

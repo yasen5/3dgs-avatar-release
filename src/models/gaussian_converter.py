@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
@@ -88,12 +87,6 @@ class GaussianConverter(nn.Module):
         loss_reg: dict[str, torch.Tensor] = {}
         # loss_reg.update(gaussians.get_opacity_loss())
         camera, loss_reg_pose = self.pose_correction(camera, iteration)
-
-        # pose augmentation
-        pose_noise = self.cfg.pipeline.pose_noise
-        if self.training and pose_noise > 0 and np.random.uniform() <= self.cfg.pipeline.pose_noise_apply_prob:
-            camera = camera.copy()
-            camera.rots = camera.rots + torch.randn(camera.rots.shape, device=camera.rots.device) * pose_noise
 
         deformed_gaussians, loss_reg_deformer = self.deformer(gaussians, camera, iteration, compute_loss)
 

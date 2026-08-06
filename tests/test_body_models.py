@@ -65,3 +65,35 @@ def test_lbs_accepts_custom_and_batched_weights() -> None:
     assert posed.shape == (2, 2, 3)
     assert torch.allclose(posed[0], expected_one)
     assert torch.allclose(posed[1], expected_one)
+
+
+class _ToyHandBodyModel(_ToyBodyModel):
+    def hand_vertex_mask(self) -> torch.Tensor:
+        return torch.tensor([False, True])
+
+    def hand_pose_parameter_mask(self) -> torch.Tensor:
+        return torch.tensor([False, True])
+
+    def hand_joint_mask(self) -> torch.Tensor:
+        return torch.tensor([False, True])
+
+
+def test_hand_interface_exposes_exact_vertices_and_freezes_other_pose_gradients() -> None:
+    model = _ToyHandBodyModel()
+    pose = torch.tensor([[2.0, 3.0]], requires_grad=True)
+
+    assert torch.equal(model.hand_vertices(), torch.tensor([[1.0, 0.0, 0.0]]))
+    restricted = model.freeze_non_hand_pose(pose)
+    restricted.sum().backward()
+
+    assert pose.grad is not None
+    assert torch.equal(pose.grad, torch.tensor([[0.0, 1.0]]))
+
+
+def test_hand_face_selection_remaps_to_compact_topology() -> None:
+    faces = np.array([[0, 1, 2], [1, 2, 3], [0, 2, 3]], dtype=np.int64)
+    selected = BodyModel.select_vertex_faces(
+        faces, torch.tensor([False, True, True, True])
+    )
+
+    assert np.array_equal(selected, np.array([[0, 1, 2]], dtype=np.int64))

@@ -27,6 +27,7 @@ from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 from src.body_models import mhr_lbs
 from src.body_models.base import BodyModel
 from src.body_models.mhr_lbs import MHRQueryOutput
+from src.constants import MHR_HAND_DIMS
 
 
 NUM_MHR_SHAPE_PARAMS = 45
@@ -181,19 +182,39 @@ class MHRBodyModel(BodyModel, nn.Module):
 
     def rest_vertices(self) -> torch.Tensor:
         """Return the shaped canonical mesh in the configured canonical pose."""
-        return self._query(self._canonical_model_params)["verts"][0]
+        vertices = self._query(self._canonical_model_params)["verts"][0]
+        return vertices[self.hand_vertex_mask().to(vertices.device)] if self.hand_only else vertices
 
     def faces(self) -> npt.NDArray[np.integer[Any]]:
-        return self._faces.detach().cpu().numpy()
+        faces = self._faces.detach().cpu().numpy()
+        return self.select_vertex_faces(faces, self.hand_vertex_mask()) if self.hand_only else faces
 
     def skinning_weights(self) -> torch.Tensor:
-        return self._skinning_weights
+        return self._skinning_weights[self.hand_vertex_mask()] if self.hand_only else self._skinning_weights
 
     def joint_parents(self) -> npt.NDArray[np.integer[Any]]:
         return self._joint_parents.detach().cpu().numpy()
 
     def face_region_mask(self) -> npt.NDArray[np.bool_]:
-        return self._face_region_mask.detach().cpu().numpy()
+        mask = self._face_region_mask
+        if self.hand_only:
+            mask = mask[self.hand_vertex_mask()]
+        return mask.detach().cpu().numpy()
+
+    def hand_vertex_mask(self) -> torch.Tensor:
+        # Complete palm/finger subtrees in the public 127-joint MHR rig.
+        hand_joints = (*range(42, 65), *range(78, 101))
+        return self._skinning_weights[:, hand_joints].sum(dim=1) >= 0.5
+
+    def hand_pose_parameter_mask(self) -> torch.Tensor:
+        mask = torch.zeros(NUM_MHR_MODEL_PARAMS, dtype=torch.bool)
+        mask[MHR_HAND_DIMS] = True
+        return mask
+
+    def hand_joint_mask(self) -> torch.Tensor:
+        mask = torch.zeros(self.num_joints, dtype=torch.bool)
+        mask[[*range(41, 65), *range(77, 101)]] = True
+        return mask
 
     def pose_transforms(
         self, pose_params: torch.Tensor

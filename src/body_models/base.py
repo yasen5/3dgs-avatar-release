@@ -24,6 +24,8 @@ import trimesh
 
 
 class BodyModel(ABC):
+    _hand_only: bool = False
+
     @abstractmethod
     def rest_vertices(self) -> torch.Tensor:
         """Canonical (rest-pose) mesh vertices, (V,3), reflecting this body
@@ -132,6 +134,87 @@ class BodyModel(ABC):
         offset, face offset, ...) owned by this body model, keyed by name.
         Backends without a CTO stage (e.g. MHR) return {}."""
         return {}
+
+    # --- Training-region interface -----------------------------------------
+
+    def hand_vertex_mask(self) -> torch.Tensor:
+        """Boolean mask over the backend's full canonical vertex topology.
+
+        Backends which support hand-only training must override this method.
+        Keeping the selection on the body-model interface prevents datasets
+        from depending on MHR/SMPL-X joint numbering or topology details.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a hand vertex selection"
+        )
+
+    def hand_pose_parameter_mask(self) -> torch.Tensor:
+        """Boolean mask over the last dimension of this backend's pose input."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose hand pose parameters"
+        )
+
+    def hand_joint_mask(self) -> torch.Tensor:
+        """Boolean mask over skeletal joints used by pose-conditioning data."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose hand joints"
+        )
+
+    @property
+    def hand_only(self) -> bool:
+        return self._hand_only
+
+    def set_hand_only(self, enabled: bool = True) -> None:
+        """Select the hand canonical topology exposed by mesh methods.
+
+        Implementations keep their full internal rig: non-hand joints are
+        still needed to place a hand in the world, but only hand vertices are
+        exposed to canonical-point-cloud consumers.
+        """
+        if enabled:
+            # Fail early when a backend has no hand implementation.
+            self.hand_vertex_mask()
+            self.hand_pose_parameter_mask()
+            self.hand_joint_mask()
+        self._hand_only = enabled
+
+    def hand_vertices(self) -> torch.Tensor:
+        """Exactly the canonical vertices belonging to both hands."""
+        was_hand_only = self._hand_only
+        self._hand_only = False
+        try:
+            vertices = self.rest_vertices()
+        finally:
+            self._hand_only = was_hand_only
+        return vertices[self.hand_vertex_mask().to(vertices.device)]
+
+    def freeze_non_hand_pose(self, pose_params: torch.Tensor) -> torch.Tensor:
+        """Keep pose values unchanged while blocking non-hand gradients.
+
+        The fixed body/arm pose continues to position the hand correctly;
+        optimizers can only change the backend-declared hand degrees of
+        freedom.
+        """
+        mask = self.hand_pose_parameter_mask().to(pose_params.device)
+        if mask.shape != (pose_params.shape[-1],):
+            raise ValueError(
+                "hand pose mask and pose parameters disagree: "
+                f"{tuple(mask.shape)} vs {tuple(pose_params.shape)}"
+            )
+        detached = pose_params.detach()
+        return detached + (pose_params - detached) * mask.to(pose_params.dtype)
+
+    @staticmethod
+    def select_vertex_faces(
+        faces: npt.NDArray[np.integer[Any]], vertex_mask: torch.Tensor
+    ) -> npt.NDArray[np.integer[Any]]:
+        """Keep all-hand triangles and remap them to the selected vertices."""
+        mask = vertex_mask.detach().cpu().numpy().astype(bool)
+        faces_i64 = np.asarray(faces, dtype=np.int64)
+        kept = faces_i64[mask[faces_i64].all(axis=1)]
+        remap = np.full(mask.shape[0], -1, dtype=np.int64)
+        remap[mask] = np.arange(mask.sum(), dtype=np.int64)
+        return np.asarray(remap[kept], dtype=np.int64)
 
 
 def skin_vertices(

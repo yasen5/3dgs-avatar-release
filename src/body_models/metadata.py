@@ -43,6 +43,9 @@ class CanonicalMetadata(TypedDict):
     body_model: NotRequired["BodyModel"]
     face_vertex_mask: NotRequired[npt.NDArray[np.bool_]]
     laplacian: NotRequired[Any]  # scipy.sparse matrix over cano_mesh's vertices
+    hand_only: NotRequired[bool]
+    hand_crop_padding: NotRequired[float]
+    hand_joint_mask: NotRequired[torch.Tensor]
 
 
 class ModelMetadata(CanonicalMetadata):

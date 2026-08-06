@@ -6,6 +6,7 @@ import torch.nn as nn
 from omegaconf import DictConfig
 
 from src.body_models import mhr_lbs
+from src.body_models.base import BodyModel
 from src.body_models.mhr_utils import local_joint_rotmats
 from src.dataset.mhr_native import MHRMetadata
 from src.scene.cameras import Camera
@@ -40,6 +41,8 @@ class DirectPoseOptimization(nn.Module):
         assert metadata is not None
         self.config = config
         self.frame_dict = metadata['frame_dict']
+        self.hand_only = bool(metadata.get('hand_only', False))
+        self._body_model: list[BodyModel | None] = [metadata.get('body_model', None)]
 
         # list-wrapped so nn.Module.__setattr__ doesn't auto-register this
         # shared, already-frozen (requires_grad_(False) at load time) MHR
@@ -66,6 +69,11 @@ class DirectPoseOptimization(nn.Module):
         idx = torch.tensor([self.frame_dict[frame]], device=self.model_params.weight.device).long()
         shape = self.shape_params_all[idx]  # (1,45), frozen
         model_params = self.model_params(idx)  # (1,204), learnable
+        if self.hand_only:
+            body_model = self._body_model[0]
+            if body_model is None:
+                raise RuntimeError("Hand-only pose optimization requires metadata['body_model']")
+            model_params = body_model.freeze_non_hand_pose(model_params)
         cam_t = self.cam_t_all[idx][0]  # (3,)
 
         out = mhr_lbs.mhr_query(self._mhr_model[0], shape, model_params, device=str(shape.device))
