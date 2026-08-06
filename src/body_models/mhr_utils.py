@@ -60,11 +60,18 @@ def local_joint_rotmats(joint_rotmat: torch.Tensor, parents: torch.Tensor) -> to
     """(B,J,3,3) global per-joint rotmats -> (B,J,3,3) LOCAL (parent-relative),
     with joint 0 (root) forced to identity -- matches this codebase's `pose_rot`
     convention: the pose encoder should see body articulation only, not the
-    person's facing direction."""
-    j = joint_rotmat.shape[1]
-    local = torch.empty_like(joint_rotmat)
+    person's facing direction.
+
+    Vectorized as a single gather + batched matmul over all J joints at
+    once, rather than a per-joint Python loop: the loop's `parents[idx]
+    .item()` forced one host<->device sync per joint (126 of them for MHR's
+    127-joint rig, per camera, every iteration), each one draining the whole
+    GPU pipeline and dominating this training loop's wall-clock time (this
+    was the single largest cause of low GPU utilization -- see hand_only
+    profiling notes). `parents` is static rig topology, never traced, so
+    gathering with it directly is safe.
+    """
+    parent_rotmat = joint_rotmat[:, parents.clamp(min=0)]  # (B,J,3,3); row 0 is a placeholder, overwritten below
+    local = torch.matmul(parent_rotmat.transpose(-1, -2), joint_rotmat)
     local[:, 0] = torch.eye(3, device=joint_rotmat.device, dtype=joint_rotmat.dtype)
-    for idx in range(1, j):
-        p = int(parents[idx].item())
-        local[:, idx] = torch.matmul(joint_rotmat[:, p].transpose(-1, -2), joint_rotmat[:, idx])
     return local

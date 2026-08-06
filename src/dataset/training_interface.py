@@ -12,12 +12,25 @@ import torch.nn.functional as F
 
 HAND_DATASET_MANIFEST = "hand_dataset_manifest.json"
 
+# Floor on the synchronized crop's output resolution. Both-hands mode is
+# self-protecting (a tiny box's crop_w/crop_h gets raised for free by the
+# other, usually-larger hand sharing the same batched grid_sample call --
+# see crop_hand_regions), but a lone/fragmented single-hand blob (real, from
+# imperfect segmentation, or a hand that's mostly out of frame) has no such
+# floor and can otherwise produce a crop a few pixels wide, which crashes
+# LPIPS's VGG trunk (its 5 stride-2 poolings need >=32px to not collapse to
+# a zero-sized feature map). grid_sample resamples continuously regardless
+# of the source box's native pixel count, so upsampling a small box to this
+# floor is free correctness-wise, not a quality tradeoff.
+_MIN_CROP_SIZE = 32
+
 
 class TrainingDataset(Protocol):
     """The small interface consumed by the upstream training loop."""
 
     hand_only: bool
     hand_crop_padding: float
+    hand_side: str | None
 
 
 def is_hand_dataset(root_dir: str, configured: bool | None = None) -> bool:
@@ -27,20 +40,38 @@ def is_hand_dataset(root_dir: str, configured: bool | None = None) -> bool:
     return (Path(root_dir) / HAND_DATASET_MANIFEST).is_file()
 
 
-def _component_boxes(mask: torch.Tensor) -> list[tuple[int, int, int, int]]:
-    """Return up to two largest hand-component boxes as ``(x1,y1,x2,y2)``."""
+def _component_boxes(
+    mask: torch.Tensor, target: tuple[float, float] | None = None
+) -> list[tuple[int, int, int, int]]:
+    """Return hand-component boxes as ``(x1,y1,x2,y2)``.
+
+    With no ``target``, returns up to the two largest components (both-hands
+    mode -- the combined hand mask usually contains one blob per hand). With
+    a ``target`` pixel, returns exactly one of those same (up to two) largest
+    components: whichever centroid is nearest ``target``. Single-hand
+    training still reads the same combined mask (it isn't split into
+    per-hand images on disk), so this is how a caller that is only rendering
+    one hand picks the matching blob and ignores the other hand's real,
+    unrelated pixels. Matching is restricted to the largest components (not
+    every blob in the mask) so a stray segmentation noise speck near
+    ``target`` can never be selected in place of the real hand.
+    """
     mask_np = mask.detach().squeeze().cpu().numpy().astype(np.uint8)
     if mask_np.ndim != 2:
         raise ValueError(f"Expected a (1,H,W) hand mask, got {tuple(mask.shape)}")
-    count, _, stats_raw, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
+    count, _, stats_raw, centroids_raw = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
     stats = np.asarray(stats_raw)
-    components = sorted(
-        (stats[i] for i in range(1, count)),
-        key=lambda stat: int(stat[cv2.CC_STAT_AREA]),
-        reverse=True,
-    )[:2]
-    if not components:
+    if count <= 1:
         raise ValueError("Hand-only loss requires at least one ground-truth hand pixel")
+    largest = sorted(
+        range(1, count), key=lambda i: int(stats[i][cv2.CC_STAT_AREA]), reverse=True
+    )[:2]
+    if target is not None:
+        centroids = np.asarray(centroids_raw)
+        distances = [np.hypot(centroids[i][0] - target[0], centroids[i][1] - target[1]) for i in largest]
+        components = [stats[largest[int(np.argmin(distances))]]]
+    else:
+        components = [stats[i] for i in largest]
     return [
         (int(s[cv2.CC_STAT_LEFT]), int(s[cv2.CC_STAT_TOP]),
          int(s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH]),
@@ -67,15 +98,24 @@ def crop_hand_regions(
     masks: Sequence[torch.Tensor],
     *,
     padding: float = 0.25,
+    component_targets: Sequence[tuple[float, float] | None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Crop both hands and stack them for one synchronized metric call.
+    """Crop hand region(s) and stack them for one synchronized metric call.
 
     Every connected hand gets 25% padding on each side.  All regions in the
     supplied view batch are then expanded to the same height/width, allowing
     L1, SSIM, LPIPS, and evaluation metrics to run once over a dense batch.
+
+    ``component_targets`` (one entry per view, or ``None`` to fall back to
+    both-hands behavior for that view) restricts each view to the single
+    hand-mask component nearest that pixel -- used for single-hand training,
+    where the on-disk mask still covers both hands but only one hand's
+    Gaussians are being rendered and evaluated.
     """
     if not images or len(images) != len(targets) or len(images) != len(masks):
         raise ValueError("images, targets, and masks must be equally-sized non-empty sequences")
+    if component_targets is not None and len(component_targets) != len(images):
+        raise ValueError("component_targets must have one entry per view")
     if padding < 0:
         raise ValueError(f"padding must be non-negative, got {padding}")
 
@@ -90,7 +130,8 @@ def crop_hand_regions(
             common_hw = (height, width)
         elif common_hw != (height, width):
             raise ValueError("Synchronized hand crops require equal image dimensions within a batch")
-        for raw_box in _component_boxes(mask):
+        component_target = component_targets[index] if component_targets is not None else None
+        for raw_box in _component_boxes(mask, component_target):
             box = _padded_box(raw_box, padding, width, height)
             max_w = max(max_w, int(np.ceil(box[2] - box[0])))
             max_h = max(max_h, int(np.ceil(box[3] - box[1])))
@@ -98,7 +139,8 @@ def crop_hand_regions(
 
     assert common_hw is not None
     height, width = common_hw
-    crop_w, crop_h = min(max_w, width), min(max_h, height)
+    crop_w = min(max(max_w, _MIN_CROP_SIZE), width)
+    crop_h = min(max(max_h, _MIN_CROP_SIZE), height)
     # Sample every exact padded ROI into the shared largest ROI resolution.
     # This preserves each hand's requested 25% field of view while issuing a
     # single synchronized GPU operation for all hands/views.

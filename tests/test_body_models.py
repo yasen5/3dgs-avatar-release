@@ -78,6 +78,31 @@ class _ToyHandBodyModel(_ToyBodyModel):
         return torch.tensor([False, True])
 
 
+def test_hand_side_defaults_to_none_and_rejects_invalid_values() -> None:
+    model = _ToyHandBodyModel()
+    assert model.hand_side is None
+
+    model.set_hand_only(True, side="left")
+    assert model.hand_side == "left"
+
+    model.set_hand_only(False)
+    assert model.hand_side is None
+
+    try:
+        model.set_hand_only(True, side="both")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for an invalid side")
+
+    try:
+        model.set_hand_only(False, side="left")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError when side is set without enabled")
+
+
 def test_hand_interface_exposes_exact_vertices_and_freezes_other_pose_gradients() -> None:
     model = _ToyHandBodyModel()
     pose = torch.tensor([[2.0, 3.0]], requires_grad=True)

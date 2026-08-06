@@ -166,6 +166,15 @@ class NeumanSMPLXDataset(Dataset[Camera]):
             self.root_dir,
             None if configured_hand_only is None else bool(configured_hand_only),
         )
+        hand_side = cfg.get("hand_side", None)
+        self.hand_side: str | None = None if hand_side is None else str(hand_side)
+        if self.hand_side is not None:
+            if not self.hand_only:
+                raise ValueError("dataset.hand_side requires dataset.hand_only=True")
+            if self.hand_side not in ("left", "right"):
+                raise ValueError(
+                    f"dataset.hand_side must be 'left' or 'right', got {self.hand_side!r}"
+                )
         self.hand_crop_padding = float(cfg.get("hand_crop_padding", 0.25))
         self.white_bg: bool = cfg.get("white_background", False)
         self.data_device: str = cfg.get("data_device", "cuda")
@@ -208,7 +217,7 @@ class NeumanSMPLXDataset(Dataset[Camera]):
             n_subdivisions=int(cfg.body_model.get("n_subdivisions", 2)),
             face_region_init=face_region_init,
         )
-        self.body_model.set_hand_only(self.hand_only)
+        self.body_model.set_hand_only(self.hand_only, side=self.hand_side)
 
         joint_offset_path = os.path.join(self.root_dir, "smplx_optimized", "joint_offset.json")
         self.joint_offset_gt: torch.Tensor

@@ -27,12 +27,22 @@ from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 from src.body_models import mhr_lbs
 from src.body_models.base import BodyModel
 from src.body_models.mhr_lbs import MHRQueryOutput
-from src.constants import MHR_HAND_DIMS
+from src.constants import MHR_HAND_DIMS, MHR_HAND_DIMS_LEFT, MHR_HAND_DIMS_RIGHT
 
 
 NUM_MHR_SHAPE_PARAMS = 45
 NUM_MHR_MODEL_PARAMS = 204
 NUM_MHR_EXPR_PARAMS = 72
+
+# Complete palm/finger subtrees in the public 127-joint MHR rig (see
+# scripts/select_unoccluded_hands.py, which independently derives and
+# verifies the same two ranges against the rig's joint hierarchy).
+_LEFT_HAND_JOINTS = tuple(range(42, 65))
+_RIGHT_HAND_JOINTS = tuple(range(78, 101))
+# One joint earlier than each subtree above: includes the wrist/forearm
+# joint that hand_joint_mask (pose-encoder context) also needs.
+_LEFT_HAND_JOINT_MASK = tuple(range(41, 65))
+_RIGHT_HAND_JOINT_MASK = tuple(range(77, 101))
 
 
 def _tensor_config_value(
@@ -202,18 +212,32 @@ class MHRBodyModel(BodyModel, nn.Module):
         return mask.detach().cpu().numpy()
 
     def hand_vertex_mask(self) -> torch.Tensor:
-        # Complete palm/finger subtrees in the public 127-joint MHR rig.
-        hand_joints = (*range(42, 65), *range(78, 101))
+        if self.hand_side == "left":
+            hand_joints = _LEFT_HAND_JOINTS
+        elif self.hand_side == "right":
+            hand_joints = _RIGHT_HAND_JOINTS
+        else:
+            hand_joints = _LEFT_HAND_JOINTS + _RIGHT_HAND_JOINTS
         return self._skinning_weights[:, hand_joints].sum(dim=1) >= 0.5
 
     def hand_pose_parameter_mask(self) -> torch.Tensor:
         mask = torch.zeros(NUM_MHR_MODEL_PARAMS, dtype=torch.bool)
-        mask[MHR_HAND_DIMS] = True
+        if self.hand_side == "left":
+            mask[list(MHR_HAND_DIMS_LEFT)] = True
+        elif self.hand_side == "right":
+            mask[list(MHR_HAND_DIMS_RIGHT)] = True
+        else:
+            mask[MHR_HAND_DIMS] = True
         return mask
 
     def hand_joint_mask(self) -> torch.Tensor:
         mask = torch.zeros(self.num_joints, dtype=torch.bool)
-        mask[[*range(41, 65), *range(77, 101)]] = True
+        if self.hand_side == "left":
+            mask[list(_LEFT_HAND_JOINT_MASK)] = True
+        elif self.hand_side == "right":
+            mask[list(_RIGHT_HAND_JOINT_MASK)] = True
+        else:
+            mask[[*_LEFT_HAND_JOINT_MASK, *_RIGHT_HAND_JOINT_MASK]] = True
         return mask
 
     def pose_transforms(

@@ -178,24 +178,34 @@ class SMPLXBodyModel(BodyModel, nn.Module):
         self._assert_built()
         return self._face_region_mask[self.hand_vertex_mask().cpu().numpy()] if self.hand_only else self._face_region_mask
 
+    # SMPL-X: body wrists are joints 20/21 and articulated fingers are joints
+    # 25..54 (22..24 are jaw/eyes), split evenly left/right (15 finger joints
+    # each) per the standard SMPL-X joint ordering.
+    _LEFT_HAND_JOINTS = (20, *range(25, 40))
+    _RIGHT_HAND_JOINTS = (21, *range(40, 55))
+
+    def _hand_joints(self) -> tuple[int, ...]:
+        if self.hand_side == "left":
+            return self._LEFT_HAND_JOINTS
+        if self.hand_side == "right":
+            return self._RIGHT_HAND_JOINTS
+        return (*self._LEFT_HAND_JOINTS, *self._RIGHT_HAND_JOINTS)
+
     def hand_vertex_mask(self) -> torch.Tensor:
         self._assert_built()
-        # SMPL-X: body wrists are joints 20/21 and articulated fingers are
-        # joints 25..54 (22..24 are jaw/eyes).
-        hand_joints = [20, 21, *range(25, 55)]
-        return self._subdiv_lbs_weights[:, hand_joints].sum(dim=1) >= 0.5
+        return self._subdiv_lbs_weights[:, self._hand_joints()].sum(dim=1) >= 0.5
 
     def hand_pose_parameter_mask(self) -> torch.Tensor:
         n_joints = int(self.model.parents.shape[0])
         mask = torch.zeros(n_joints, 3, dtype=torch.bool)
-        mask[[20, 21, *range(25, 55)]] = True
+        mask[list(self._hand_joints())] = True
         return mask.reshape(-1)
 
     def hand_joint_mask(self) -> torch.Tensor:
         return self.hand_pose_parameter_mask().reshape(-1, 3).any(dim=1)
 
-    def set_hand_only(self, enabled: bool = True) -> None:
-        super().set_hand_only(enabled)
+    def set_hand_only(self, enabled: bool = True, side: str | None = None) -> None:
+        super().set_hand_only(enabled, side)
         if enabled and self._hand_joint_grad_hook is None:
             joint_mask = self.hand_joint_mask()
             self._hand_joint_grad_hook = self.joint_offset.register_hook(

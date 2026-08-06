@@ -91,6 +91,15 @@ class MHRNativeDataset(Dataset[Camera]):
             self.root_dir,
             None if configured_hand_only is None else bool(configured_hand_only),
         )
+        hand_side = cfg.get("hand_side", None)
+        self.hand_side: str | None = None if hand_side is None else str(hand_side)
+        if self.hand_side is not None:
+            if not self.hand_only:
+                raise ValueError("dataset.hand_side requires dataset.hand_only=True")
+            if self.hand_side not in ("left", "right"):
+                raise ValueError(
+                    f"dataset.hand_side must be 'left' or 'right', got {self.hand_side!r}"
+                )
         self.hand_crop_padding = float(cfg.get("hand_crop_padding", 0.25))
         self.white_bg: bool = cfg.white_background
         self.device: str = cfg.mhr_device
@@ -138,7 +147,7 @@ class MHRNativeDataset(Dataset[Camera]):
             model=self.mhr_model,
             state_dict=state_dict,
         )
-        self.body_model.set_hand_only(self.hand_only)
+        self.body_model.set_hand_only(self.hand_only, side=self.hand_side)
         self.faces = self.body_model.faces()
         self.dense_skinning_weights = self.body_model.skinning_weights().numpy()
         self.joint_parents = torch.from_numpy(self.body_model.joint_parents())

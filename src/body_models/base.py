@@ -25,6 +25,7 @@ import trimesh
 
 class BodyModel(ABC):
     _hand_only: bool = False
+    _hand_side: str | None = None
 
     @abstractmethod
     def rest_vertices(self) -> torch.Tensor:
@@ -164,13 +165,28 @@ class BodyModel(ABC):
     def hand_only(self) -> bool:
         return self._hand_only
 
-    def set_hand_only(self, enabled: bool = True) -> None:
+    @property
+    def hand_side(self) -> str | None:
+        """``'left'``/``'right'`` when hand-only training is restricted to a
+        single hand, or ``None`` when both hands are exposed."""
+        return self._hand_side
+
+    def set_hand_only(self, enabled: bool = True, side: str | None = None) -> None:
         """Select the hand canonical topology exposed by mesh methods.
 
         Implementations keep their full internal rig: non-hand joints are
         still needed to place a hand in the world, but only hand vertices are
         exposed to canonical-point-cloud consumers.
+
+        ``side`` further restricts that selection to a single hand (roughly
+        halving vertex/Gaussian count for an even faster hand-only smoke
+        test); it must be ``None`` unless ``enabled`` is set.
         """
+        if side not in (None, "left", "right"):
+            raise ValueError(f"side must be 'left', 'right', or None, got {side!r}")
+        if not enabled and side is not None:
+            raise ValueError("side requires enabled=True")
+        self._hand_side = side
         if enabled:
             # Fail early when a backend has no hand implementation.
             self.hand_vertex_mask()

@@ -72,10 +72,15 @@ class Camera:
         self.trans: npt.NDArray[np.floating[Any]] = np.array([0.0, 0.0, 0.0])
         self.scale: float = 1.0
 
-        self.original_image: torch.Tensor = self.image.clamp(0.0, 1.0).to(self.data_device)
+        # non_blocking=True lets these H2D copies queue on the CUDA stream and
+        # return immediately instead of blocking the CPU thread until the
+        # copy completes -- only actually asynchronous if the source tensor
+        # is pinned (see train.py's DataLoader(pin_memory=True)), but it's a
+        # harmless no-op otherwise.
+        self.original_image: torch.Tensor = self.image.clamp(0.0, 1.0).to(self.data_device, non_blocking=True)
         self.image_width: int = self.original_image.shape[2]
         self.image_height: int = self.original_image.shape[1]
-        self.original_mask: torch.Tensor = self.mask.float().to(self.data_device)
+        self.original_mask: torch.Tensor = self.mask.float().to(self.data_device, non_blocking=True)
 
         self.zfar: float = 100.0
         self.znear: float = 0.01
@@ -91,11 +96,11 @@ class Camera:
         ).squeeze(0)
         self.camera_center: torch.Tensor = self.world_view_transform.inverse()[3, :3]
 
-        self.rots = self.rots.to(self.data_device)
-        self.Jtrs = self.Jtrs.to(self.data_device)
-        self.bone_transforms = self.bone_transforms.to(self.data_device)
+        self.rots = self.rots.to(self.data_device, non_blocking=True)
+        self.Jtrs = self.Jtrs.to(self.data_device, non_blocking=True)
+        self.bone_transforms = self.bone_transforms.to(self.data_device, non_blocking=True)
         if self.align_matrix is not None:
-            self.align_matrix = self.align_matrix.to(self.data_device)
+            self.align_matrix = self.align_matrix.to(self.data_device, non_blocking=True)
 
     def copy(self) -> Camera:
         return copy_module.copy(self)

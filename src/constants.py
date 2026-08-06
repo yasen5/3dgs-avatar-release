@@ -61,6 +61,18 @@ MHR_HAND_DIMS = [
     106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
 ]
 
+# Per-hand split of MHR_HAND_DIMS, for single-hand training (see
+# BodyModel.set_hand_only's `side` argument). Found by finite-differencing
+# each dim of a real fit's mhr_model_params (perturb by +0.3, re-run
+# mhr_query) and checking which hand's hand_vertex_mask (mhr_body_model.py)
+# moved: dims 68-94 move only the joints-42-64 (left) hand, dims 95-115 move
+# only the joints-78-100 (right) hand. Dims 62-67 move neither hand under
+# this test (apparently unused DOFs) and are intentionally in neither list --
+# both-hands mode (MHR_HAND_DIMS above) still includes them for parity with
+# its pre-existing behavior.
+MHR_HAND_DIMS_LEFT = tuple(range(68, 95))
+MHR_HAND_DIMS_RIGHT = tuple(range(95, 116))
+
 # MHR joint indices (into mhr_lbs.mhr_query's 127-joint output) for each hand's 21-keypoint
 # wrist->finger chain, in standard wrist-first order (0=wrist,1-4=thumb,...,17-20=pinky) --
 # found by walking joint_parents from the wrist down each of the 5 finger chains and confirmed
