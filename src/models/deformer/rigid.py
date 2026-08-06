@@ -85,6 +85,63 @@ class SkinningField(RigidDeform):
         pts_W = self.softmax(torch.log(default_w + 1e-9) + offset_logits)
         return pts_W
 
+    def predict_skinning_weights_batched(self, xyz_norm_b: torch.Tensor) -> torch.Tensor:
+        """Batched form of predict_skinning_weights: xyz_norm_b is (B,N,3)
+        (one canonical position set per view -- these can legitimately differ
+        slightly across views since the non-rigid deformer runs first and its
+        per-view delta is already baked into xyz_norm_b by the caller) and
+        the KNN lookup + offset MLP both run once across the whole (B,N)
+        batch instead of once per view. Not used when distill=True (no
+        caller needs that combination yet)."""
+        B, N, _ = xyz_norm_b.shape
+        with torch.no_grad():
+            cano_verts_b = self.cano_verts_norm.unsqueeze(0).expand(B, -1, -1).contiguous()
+            _, idx, _ = knn_points(xyz_norm_b, cano_verts_b, K=1)
+        default_w = self.skinning_weights_t[idx.view(B, N)]        # (B,N,J)
+        offset_logits = self.lbs_network(xyz_norm_b)                # (B,N,J)
+        pts_W = self.softmax(torch.log(default_w + 1e-9) + offset_logits)
+        return pts_W
+
+    def get_forward_transform_batched(self, xyz_b: torch.Tensor, tfs_b: torch.Tensor) -> torch.Tensor:
+        assert not self.distill, "batched get_forward_transform not implemented for distill=True"
+        pts_W = self.predict_skinning_weights_batched(xyz_b)  # (B,N,J)
+        B, N, J = pts_W.shape
+        T_fwd = torch.einsum("bnj,bjk->bnk", pts_W, tfs_b.reshape(B, J, 16)).view(B, N, 4, 4).float()
+        return T_fwd
+
+    def forward_batch(
+        self, gaussians_list: list[GaussianModel], iteration: int, cameras: list[Camera]
+    ) -> list[GaussianModel]:
+        """Batched equivalent of forward(): the KNN skinning-weight lookup
+        and its offset MLP run once across every view in the batch (one
+        batched matmul each) instead of once per view, and the per-view bone
+        transforms are applied via einsum instead of a Python loop of
+        matmuls. `gaussians_list` is one already-non-rigid-deformed
+        GaussianModel per view (see HashGridwithMLP.forward_batch) since
+        their canonical positions can legitimately differ slightly."""
+        B = len(gaussians_list)
+        xyz_b = torch.stack([g.get_xyz for g in gaussians_list])          # (B,N,3)
+        n_pts = xyz_b.shape[1]
+        xyz_norm_b = self.aabb.normalize(xyz_b, sym=True)
+        tfs_b = torch.stack([cam.bone_transforms for cam in cameras])      # (B,J,4,4)
+        T_fwd_b = self.get_forward_transform_batched(xyz_norm_b, tfs_b)    # (B,N,4,4)
+
+        homo_coord = torch.ones(B, n_pts, 1, dtype=torch.float32, device=xyz_b.device)
+        x_hat_homo = torch.cat([xyz_b, homo_coord], dim=-1)                 # (B,N,4)
+        x_bar = torch.einsum("bnij,bnj->bni", T_fwd_b, x_hat_homo)         # (B,N,4)
+
+        rotation_hat_b = torch.stack([build_rotation(g._rotation) for g in gaussians_list])  # (B,N,3,3)
+        rotation_bar = torch.einsum("bnij,bnjk->bnik", T_fwd_b[:, :, :3, :3], rotation_hat_b)  # (B,N,3,3)
+
+        out: list[GaussianModel] = []
+        for b, g in enumerate(gaussians_list):
+            deformed_gaussians = g.clone()
+            deformed_gaussians.set_fwd_transform(T_fwd_b[b].detach())
+            deformed_gaussians._xyz = x_bar[b, :, :3]
+            deformed_gaussians.rotation_precomp = rotation_bar[b]
+            out.append(deformed_gaussians)
+        return out
+
     def get_forward_transform(self, xyz: torch.Tensor, tfs: torch.Tensor) -> torch.Tensor:
         if self.distill:
             self.precompute(recompute_skinning=self.training)

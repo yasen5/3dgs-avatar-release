@@ -232,9 +232,15 @@ class NeumanSMPLXDataset(Dataset[Camera]):
         self.get_metadata()
 
         self._image_dir = os.path.join(self.root_dir, "images")
-        self._mask_dir = os.path.join(
-            self.root_dir, "hand_masks" if self.hand_only else "masks"
-        )
+        if self.hand_only:
+            # Left/right hand masks are split at preprocessing time (see
+            # scripts/prepare_sapiens_hand_dataset.py) into hand_masks/left
+            # and hand_masks/right; hand_masks/ itself stays the union of
+            # both hands, used when hand_side is None (both-hands training).
+            mask_subdir = "hand_masks" if self.hand_side is None else os.path.join("hand_masks", self.hand_side)
+        else:
+            mask_subdir = "masks"
+        self._mask_dir = os.path.join(self.root_dir, mask_subdir)
         # Sapiens-precomputed geometric supervision (GA-Avatar's L_geo). Not
         # part of the ExAvatar preprocessing this dataset otherwise reads --
         # generated separately (see skills/ or the plan doc's data-prep

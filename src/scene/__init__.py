@@ -80,6 +80,11 @@ class Scene:
         )
         return result
 
+    def convert_gaussians_batch(
+        self, cameras: list[Camera], iteration: int, compute_loss: bool = True
+    ) -> tuple[list[GaussianModel], dict[str, torch.Tensor], torch.Tensor]:
+        return self.converter.forward_batch(self.gaussians, cameras, iteration, compute_loss)
+
     def get_skinning_loss(self) -> torch.Tensor:
         loss_reg = self.converter.deformer.rigid.regularization()
         loss_skinning = loss_reg.get('loss_skinning', torch.tensor(0.).cuda())

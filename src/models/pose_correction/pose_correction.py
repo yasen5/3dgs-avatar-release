@@ -100,6 +100,65 @@ class DirectPoseOptimization(nn.Module):
         loss_pose = (model_params - self.model_params_init[idx]).square().mean()
         return updated_camera, {'pose': loss_pose}
 
+    def forward_batch(
+        self, cameras: list[Camera], iteration: int
+    ) -> tuple[list[Camera], dict[str, torch.Tensor]]:
+        """Batched equivalent of forward(): one MHR query for every camera's
+        frame instead of one Python-level call per camera. mhr_query,
+        joint_relative_transforms and local_joint_rotmats already carry a
+        real batch dimension (see their docstrings) -- forward() just never
+        fed them more than one frame at a time. Falls back to the per-camera
+        loop whenever a camera's frame isn't in frame_dict (forward()'s
+        early-return path), which real training data never hits.
+        """
+        if iteration < self.config.delay:
+            return list(cameras), {}
+
+        if any(cam.frame_id not in self.frame_dict for cam in cameras):
+            updated_cams: list[Camera] = []
+            pose_losses = []
+            for cam in cameras:
+                updated, loss_reg = self.forward(cam, iteration)
+                updated_cams.append(updated)
+                if 'pose' in loss_reg:
+                    pose_losses.append(loss_reg['pose'])
+            loss_reg_out = {'pose': torch.stack(pose_losses).mean()} if pose_losses else {}
+            return updated_cams, loss_reg_out
+
+        B = len(cameras)
+        device = self.model_params.weight.device
+        idx = torch.tensor([self.frame_dict[cam.frame_id] for cam in cameras], device=device).long()  # (B,)
+        shape = self.shape_params_all[idx]        # (B,45), frozen
+        model_params = self.model_params(idx)     # (B,204), learnable
+        if self.hand_only:
+            body_model = self._body_model[0]
+            if body_model is None:
+                raise RuntimeError("Hand-only pose optimization requires metadata['body_model']")
+            model_params = body_model.freeze_non_hand_pose(model_params)
+        cam_t = self.cam_t_all[idx]               # (B,3)
+
+        mhr_out = mhr_lbs.mhr_query(self._mhr_model[0], shape, model_params, device=str(shape.device))
+        joint_pos = mhr_out['joint_pos']          # (B,127,3)
+        joint_rotmat = mhr_out['joint_rotmat']    # (B,127,3,3)
+
+        pose_rot = local_joint_rotmats(joint_rotmat, self.joint_parents).reshape(B, -1, 9)  # (B,127,9)
+
+        bone_transforms = mhr_lbs.joint_relative_transforms(
+            joint_pos, joint_rotmat,
+            self.big_pose_joint_pos.unsqueeze(0).expand(B, -1, -1),
+            self.big_pose_joint_rotmat.unsqueeze(0).expand(B, -1, -1, -1),
+        ).clone()  # (B,127,4,4)
+        bone_transforms[:, :, :3, 3] = bone_transforms[:, :, :3, 3] + cam_t.unsqueeze(1)
+
+        updated_cameras: list[Camera] = []
+        for b, cam in enumerate(cameras):
+            updated = cam.copy()
+            updated.update(rots=pose_rot[b:b + 1], bone_transforms=bone_transforms[b])
+            updated_cameras.append(updated)
+
+        loss_pose = (model_params - self.model_params_init[idx]).square().mean()
+        return updated_cameras, {'pose': loss_pose}
+
     def regularization(self, out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {}
 

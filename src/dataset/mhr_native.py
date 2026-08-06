@@ -284,10 +284,15 @@ class MHRNativeDataset(Dataset[Camera]):
             raise FileNotFoundError(f"No MHR raw fits found in {raw_dir}")
 
         image_dir = os.path.join(self.camera_dir, 'images')
-        mask_dir = os.path.join(
-            self.camera_dir,
-            "hand_masks" if self.hand_only else str(self.cfg.mask_dir),
-        )
+        if self.hand_only:
+            # Left/right hand masks are split at preprocessing time (see
+            # scripts/prepare_sapiens_hand_dataset.py) into hand_masks/left
+            # and hand_masks/right; hand_masks/ itself stays the union of
+            # both hands, used when hand_side is None (both-hands training).
+            mask_subdir = "hand_masks" if self.hand_side is None else os.path.join("hand_masks", self.hand_side)
+        else:
+            mask_subdir = str(self.cfg.mask_dir)
+        mask_dir = os.path.join(self.camera_dir, mask_subdir)
         frame_ids: list[str] = []
         shape_params: list[npt.NDArray[np.floating[Any]]] = []
         model_params: list[npt.NDArray[np.floating[Any]]] = []

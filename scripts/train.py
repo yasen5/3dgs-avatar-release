@@ -54,25 +54,6 @@ from src.utils.loss_utils import (
 )
 
 
-def hand_render_target(
-    opacity: torch.Tensor | None, threshold: float = 0.5
-) -> tuple[float, float] | None:
-    """Pixel centroid (x,y) of a single-hand render's own opacity mass.
-
-    Single-hand training still reads a combined (both-hands) ground-truth
-    mask off disk -- see crop_hand_regions' `component_targets`. This gives
-    that call the pixel location of the hand actually being rendered this
-    iteration, so it selects the matching mask blob instead of the other,
-    unrendered hand's.
-    """
-    if opacity is None:
-        return None
-    ys, xs = torch.nonzero(opacity.squeeze(0) > threshold, as_tuple=True)
-    if ys.numel() == 0:
-        return None
-    return float(xs.float().mean()), float(ys.float().mean())
-
-
 def retrieve_scheduled_value(iteration: int, value: float | int | ListConfig) -> float:
     if isinstance(value, int) or isinstance(value, float):
         return float(value)
@@ -239,7 +220,7 @@ def training(config: DictConfig, diagnostics: TrainingDiagnostics) -> None:
 
         hand_only = bool(getattr(scene.train_dataset, "hand_only", False))
         hand_side = getattr(scene.train_dataset, "hand_side", None) if hand_only else None
-        need_hand_target = hand_side is not None
+        max_hand_components = 1 if hand_side is not None else 2
 
         # GA-Avatar's L_geo (normal + depth vs. Sapiens-precomputed maps).
         # Absent from every other config (opt.get(..., 0.) keeps this
@@ -268,7 +249,7 @@ def training(config: DictConfig, diagnostics: TrainingDiagnostics) -> None:
         # hazard to route around at all.
         render_pkgs = render_batch(
             cams, iteration, scene, pipe, background, compute_loss=True,
-            return_opacity=use_mask or need_hand_target,
+            return_opacity=use_mask,
             return_normal=use_normal, return_depth=use_depth,
         )
 
@@ -291,16 +272,12 @@ def training(config: DictConfig, diagnostics: TrainingDiagnostics) -> None:
         loss_reg_sums: dict[str, torch.Tensor] = {}
 
         if hand_only:
-            component_targets = (
-                [hand_render_target(pkg["opacity_render"]) for pkg in render_pkgs]
-                if need_hand_target else None
-            )
             metric_images, metric_targets = crop_hand_regions(
                 [pkg["render"] for pkg in render_pkgs],
                 [cam.original_image.cuda() for cam in cams],
                 [cam.original_mask for cam in cams],
                 padding=float(getattr(scene.train_dataset, "hand_crop_padding", 0.25)),
-                component_targets=component_targets,
+                max_components=max_hand_components,
             )
         else:
             metric_images = torch.stack([pkg["render"] for pkg in render_pkgs])
@@ -550,13 +527,10 @@ def validation(
                 eval_dataset = getattr(scene, val_config['name'] + '_dataset')
                 if bool(getattr(eval_dataset, "hand_only", False)):
                     eval_hand_side = getattr(eval_dataset, "hand_side", None)
-                    eval_component_target = (
-                        hand_render_target(opacity_render) if eval_hand_side is not None else None
-                    )
                     eval_image, eval_target = crop_hand_regions(
                         [image], [gt_image], [data.original_mask],
                         padding=float(getattr(eval_dataset, "hand_crop_padding", 0.25)),
-                        component_targets=[eval_component_target] if eval_hand_side is not None else None,
+                        max_components=1 if eval_hand_side is not None else 2,
                     )
                 else:
                     eval_image, eval_target = image, gt_image

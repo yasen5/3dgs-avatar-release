@@ -42,57 +42,54 @@ def test_hand_crops_synchronize_across_views() -> None:
     assert torch.equal(crops[:, 0, 0, 0], torch.tensor([0.0, 1.0]))
 
 
-def test_component_target_selects_single_nearest_hand() -> None:
-    # Both hands present in the combined on-disk mask, as in the real
-    # single-hand-training case; component_targets picks only the blob
-    # nearest the render's own hand position and drops the other one. Boxes
-    # are >=32px on a side so the min-crop-size floor is a no-op here and
-    # the crop reproduces the source pixels exactly (padding=0).
+def test_max_components_one_selects_largest_hand() -> None:
+    # Single-hand training reads a mask preprocessed to contain only that
+    # hand's pixels (see scripts/prepare_sapiens_hand_dataset.py), but a
+    # smaller stray blob can still show up from imperfect segmentation --
+    # max_components=1 keeps only the largest. Boxes are >=32px on a side so
+    # the min-crop-size floor is a no-op here and the crop reproduces the
+    # source pixels exactly (padding=0).
     image = torch.arange(3 * 80 * 120, dtype=torch.float32).reshape(3, 80, 120)
     mask = torch.zeros(1, 80, 120)
-    mask[:, 10:50, 10:50] = 1  # 40x40, centroid ~ (29.5, 29.5)
-    mask[:, 20:70, 70:120] = 1  # 50x50, centroid ~ (94.5, 44.5), the larger blob
+    mask[:, 10:50, 10:50] = 1  # 40x40, the real hand
+    mask[:, 60:70, 100:110] = 1  # 10x10, a smaller stray blob
 
     crops, _ = crop_hand_regions(
-        [image], [image], [mask], padding=0.0, component_targets=[(29.5, 29.5)]
-    )
-
-    # Exactly one region selected (the nearer blob), not the larger one.
-    assert crops.shape == (1, 3, 40, 40)
-    assert torch.allclose(crops[0], image[:, 10:50, 10:50], atol=1e-2)
-
-
-def test_component_target_ignores_noise_specks_near_target() -> None:
-    # A stray 1px segmentation-noise speck sits right next to the target,
-    # much closer than either real hand blob -- it must never be selected in
-    # place of the real hand: candidates are restricted to the (up to two)
-    # largest components before nearest-to-target matching runs.
-    image = torch.arange(3 * 80 * 120, dtype=torch.float32).reshape(3, 80, 120)
-    mask = torch.zeros(1, 80, 120)
-    mask[:, 10:50, 10:50] = 1  # real hand, centroid ~ (29.5, 29.5)
-    mask[:, 20:70, 70:120] = 1  # other real hand
-    mask[:, 0, 0] = 1  # noise speck, right at the target
-
-    crops, _ = crop_hand_regions(
-        [image], [image], [mask], padding=0.0, component_targets=[(0.0, 0.0)]
+        [image], [image], [mask], padding=0.0, max_components=1
     )
 
     assert crops.shape == (1, 3, 40, 40)
     assert torch.allclose(crops[0], image[:, 10:50, 10:50], atol=1e-2)
 
 
-def test_component_target_none_falls_back_to_both_hands() -> None:
+def test_max_components_one_ignores_noise_specks() -> None:
+    # A stray 1px segmentation-noise speck must never be selected in place of
+    # the real hand: candidates are restricted to the largest component.
+    image = torch.arange(3 * 80 * 120, dtype=torch.float32).reshape(3, 80, 120)
+    mask = torch.zeros(1, 80, 120)
+    mask[:, 10:50, 10:50] = 1  # the real hand
+    mask[:, 0, 0] = 1  # noise speck
+
+    crops, _ = crop_hand_regions(
+        [image], [image], [mask], padding=0.0, max_components=1
+    )
+
+    assert crops.shape == (1, 3, 40, 40)
+    assert torch.allclose(crops[0], image[:, 10:50, 10:50], atol=1e-2)
+
+
+def test_max_components_two_is_the_default_both_hands_behavior() -> None:
     image = torch.arange(3 * 20 * 30, dtype=torch.float32).reshape(3, 20, 30)
     mask = torch.zeros(1, 20, 30)
     mask[:, 4:8, 2:6] = 1
     mask[:, 10:16, 20:28] = 1
 
-    with_none, _ = crop_hand_regions(
-        [image], [image], [mask], padding=0.25, component_targets=[None]
+    explicit, _ = crop_hand_regions(
+        [image], [image], [mask], padding=0.25, max_components=2
     )
-    without_arg, _ = crop_hand_regions([image], [image], [mask], padding=0.25)
+    default, _ = crop_hand_regions([image], [image], [mask], padding=0.25)
 
-    assert torch.equal(with_none, without_arg)
+    assert torch.equal(explicit, default)
 
 
 def test_min_crop_size_floors_a_lone_tiny_hand_box() -> None:
@@ -106,7 +103,7 @@ def test_min_crop_size_floors_a_lone_tiny_hand_box() -> None:
     mask[:, 4:8, 2:6] = 1  # a tiny 4x4 box, alone
 
     crops, _ = crop_hand_regions(
-        [image], [image], [mask], padding=0.0, component_targets=[(3.5, 5.5)]
+        [image], [image], [mask], padding=0.0, max_components=1
     )
 
     assert crops.shape == (1, 3, 20, 30)

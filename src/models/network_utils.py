@@ -294,8 +294,15 @@ class VanillaCondMLP(nn.Module):
         self.activation = nn.LeakyReLU()
 
     def forward(self, coords: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
-        if cond is not None:
-            cond = cond.expand(coords.shape[0], -1)
+        if cond is not None and cond.shape[:-1] != coords.shape[:-1]:
+            # dim=-1 (not the old hardcoded dim=1) so this also accepts an
+            # extra leading batch-of-views dim: coords/cond as (B,N,D) let a
+            # caller run every view's MLP forward pass in one batched call
+            # (see HashGridwithMLP.forward_batch / ColorMLP.forward_batch)
+            # instead of one Python-level call per view -- nn.Linear already
+            # applies to just the last dim, so this is the only shape
+            # assumption in this class that needed generalizing.
+            cond = cond.expand(*coords.shape[:-1], cond.shape[-1])
 
         coords_embedded: torch.Tensor
         if self.embed_fn is not None:
@@ -309,10 +316,10 @@ class VanillaCondMLP(nn.Module):
 
             if l in self.config.cond_in:
                 assert cond is not None
-                x = torch.cat([x, cond], 1)
+                x = torch.cat([x, cond], dim=-1)
 
             if l in self.config.skip_in:
-                x = torch.cat([x, coords_embedded], 1) * SKIP_CONNECTION_SCALE
+                x = torch.cat([x, coords_embedded], dim=-1) * SKIP_CONNECTION_SCALE
 
             x = lin(x)
 

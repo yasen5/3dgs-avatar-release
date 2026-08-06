@@ -33,5 +33,29 @@ class Deformer(nn.Module):
         loss_reg.update(loss_non_rigid)
         return deformed_gaussians, loss_reg
 
+    def forward_batch(
+        self, gaussians: GaussianModel, cameras: list[Camera], iteration: int, compute_loss: bool = True
+    ) -> tuple[list[GaussianModel], dict[str, torch.Tensor]]:
+        """Batched equivalent of forward(): uses non_rigid/rigid's own
+        forward_batch when both implement one (currently HashGridwithMLP and
+        SkinningField -- this repo's paper-default config), otherwise falls
+        back to calling forward() once per camera so every other
+        rigid/non-rigid combination (VertexLBS, GAAvatarGeo, MLP, HannwMLP)
+        keeps its exact previous per-view behavior unchanged."""
+        if not (hasattr(self.non_rigid, 'forward_batch') and hasattr(self.rigid, 'forward_batch')):
+            out: list[GaussianModel] = []
+            loss_accum: dict[str, list[torch.Tensor]] = {}
+            for cam in cameras:
+                dg, loss_reg = self.forward(gaussians, cam, iteration, compute_loss)
+                out.append(dg)
+                for k, v in loss_reg.items():
+                    loss_accum.setdefault(k, []).append(v)
+            loss_reg_out = {k: torch.stack(v).mean() for k, v in loss_accum.items()}
+            return out, loss_reg_out
+
+        gaussians_list, loss_non_rigid = self.non_rigid.forward_batch(gaussians, iteration, cameras, compute_loss)
+        gaussians_list = self.rigid.forward_batch(gaussians_list, iteration, cameras)
+        return gaussians_list, loss_non_rigid
+
 def get_deformer(cfg: DictConfig, metadata: MHRMetadata) -> Deformer:
     return Deformer(cfg, metadata)

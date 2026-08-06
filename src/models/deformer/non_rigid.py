@@ -312,6 +312,105 @@ class HashGridwithMLP(NonRigidDeform):
             loss_reg = {}
         return deformed_gaussians, loss_reg
 
+    def forward_batch(
+        self, gaussians: GaussianModel, iteration: int, cameras: list[Camera], compute_loss: bool = True
+    ) -> tuple[list[GaussianModel], dict[str, torch.Tensor]]:
+        """Batched equivalent of forward(): the hashgrid encoding of the
+        (shared, canonical, camera-independent) Gaussian positions runs
+        exactly once instead of once per view, the pose encoder runs one
+        batched call over every view's pose instead of one call per view
+        (it already accepted a batch dim -- see HierarchicalPoseEncoder),
+        and the delta MLP runs one batched (B,N,D) forward pass instead of
+        B separate (N,D) calls."""
+        B = len(cameras)
+        device = gaussians.get_xyz.device
+        if iteration < self.delay:
+            out: list[GaussianModel] = []
+            for _ in range(B):
+                dg = gaussians.clone()
+                if self.feature_dim > 0:
+                    dg.non_rigid_feature = torch.zeros(gaussians.get_xyz.shape[0], self.feature_dim, device=device)
+                out.append(dg)
+            return out, {}
+
+        rots = torch.cat([cam.rots for cam in cameras], dim=0)   # (B,J,9)
+        Jtrs = torch.cat([cam.Jtrs for cam in cameras], dim=0)   # (B,J,3)
+        pose_feat = self.pose_encoder(rots, Jtrs)                 # (B, d_pose)
+
+        if self.latent_dim > 0:
+            idxs = [
+                self.frame_dict[cam.frame_id] if cam.frame_id in self.frame_dict else len(self.frame_dict) - 1
+                for cam in cameras
+            ]
+            latent_idx = torch.tensor(idxs, device=pose_feat.device).long()
+            latent_code = self.latent(latent_idx)                 # (B, latent_dim)
+            pose_feat = torch.cat([pose_feat, latent_code], dim=1)
+
+        xyz = gaussians.get_xyz
+        N = xyz.shape[0]
+        xyz_norm = self.aabb.normalize(xyz, sym=True)
+        feature = self.hashgrid(xyz_norm)                          # (N, D_grid) computed ONCE
+
+        feat_b = feature.unsqueeze(0).expand(B, N, -1)
+        cond_b = pose_feat.unsqueeze(1).expand(B, N, -1)
+        deltas = self.mlp(feat_b, cond=cond_b)                      # (B,N,D_out), one batched MLP call
+
+        delta_xyz = deltas[..., :3]
+        delta_scale = deltas[..., 3:6]
+        delta_rot = deltas[..., 6:10]
+
+        xyz_all = gaussians._xyz + delta_xyz                        # (B,N,3)
+
+        scale_offset = self.cfg.scale_offset
+        if scale_offset == 'logit':
+            scaling_all = gaussians._scaling + delta_scale
+        elif scale_offset == 'exp':
+            scaling_all = torch.log(torch.clamp_min(gaussians.get_scaling + delta_scale, SCALE_EXP_MIN_EPS))
+        elif scale_offset == 'zero':
+            delta_scale = torch.zeros_like(delta_scale)
+            scaling_all = gaussians._scaling.unsqueeze(0).expand(B, -1, -1)
+        else:
+            raise ValueError
+
+        rot_offset = self.cfg.rot_offset
+        rotation_base = gaussians._rotation.unsqueeze(0).expand(B, -1, -1)
+        if rot_offset == 'add':
+            rotation_all = rotation_base + delta_rot
+            delta_rot_for_loss = delta_rot
+        elif rot_offset == 'mult':
+            # Matches forward()'s exact (if odd) "mult" behavior: overwrite
+            # the w-component in place, then compute the regularization loss
+            # on only the remaining 3 (not all 4) components.
+            delta_rot = delta_rot.clone()
+            delta_rot[..., 0] = QUATERNION_IDENTITY_W
+            rotation_all = tf.quaternion_multiply(delta_rot, rotation_base)
+            delta_rot_for_loss = delta_rot[..., 1:]
+        else:
+            raise ValueError
+
+        feat_extra = deltas[..., 10:] if self.feature_dim > 0 else None
+
+        out = []
+        for b in range(B):
+            dg = gaussians.clone()
+            dg._xyz = xyz_all[b]
+            dg._scaling = scaling_all[b]
+            dg._rotation = rotation_all[b]
+            if feat_extra is not None:
+                dg.non_rigid_feature = feat_extra[b]
+            out.append(dg)
+
+        loss_reg: dict[str, torch.Tensor]
+        if compute_loss:
+            loss_reg = {
+                'nr_xyz': torch.norm(delta_xyz, p=2, dim=-1).mean(),
+                'nr_scale': torch.norm(delta_scale, p=1, dim=-1).mean(),
+                'nr_rot': torch.norm(delta_rot_for_loss, p=1, dim=-1).mean(),
+            }
+        else:
+            loss_reg = {}
+        return out, loss_reg
+
 class GAAvatarGeo(NonRigidDeform):
     """GA-Avatar's GeoNet: a base MLP(F_tri) -> static (delta_mu_f, s_f) and a
     pose-conditioned refine MLP(F_tri, theta) -> pose-dependent

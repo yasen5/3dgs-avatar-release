@@ -101,19 +101,25 @@ def render_batch(cams: list[Camera],
     against zero. Both are gated to lambda=0 in every current config, so
     this has no effect on any config actually in use.
     """
-    pcs: list[GaussianModel] = []
-    loss_regs: list[dict[str, torch.Tensor]] = []
-    colors_list: list[torch.Tensor] = []
-    for cam in cams:
-        pc, loss_reg, colors_precomp = scene.convert_gaussians(cam, iteration, compute_loss)
-        pcs.append(pc)
-        loss_regs.append(loss_reg)
-        colors_list.append(colors_precomp)
+    # convert_gaussians_batch runs pose-correction + the rigid/non-rigid
+    # deformer + the texture MLP as batched tensor ops across every view in
+    # `cams` at once (one MHR query, one hashgrid encoding, one skinning-MLP
+    # call, one texture-MLP call -- see GaussianConverter.forward_batch and
+    # its callees) instead of a Python loop calling convert_gaussians() once
+    # per view. That per-view loop used to be the actual bottleneck: only
+    # the final rasterize call below was ever batched, while the deformer/
+    # texture forward passes -- the more expensive part, since they run a
+    # neural network over every Gaussian -- stayed serial regardless of
+    # batch_size, capping GPU utilization well under the render call's real
+    # ceiling (see hand_only profiling notes). pcs is still one GaussianModel
+    # per view afterward, so everything below is unchanged.
+    pcs, loss_reg_shared, colors = scene.convert_gaussians_batch(cams, iteration, compute_loss)
+    loss_regs: list[dict[str, torch.Tensor]] = [loss_reg_shared for _ in cams]
 
     means = torch.stack([pc.get_xyz for pc in pcs])                             # (B,N,3)
     covars = torch.stack([_full_covariance(pc, scaling_modifier) for pc in pcs])  # (B,N,3,3)
     opacities = torch.stack([pc.get_opacity.squeeze(-1) for pc in pcs])         # (B,N)
-    colors = torch.stack(colors_list)                                          # (B,N,3)
+    # colors already (B,N,3) from convert_gaussians_batch
 
     normals: list[torch.Tensor] | None = None
     if return_normal:

@@ -133,6 +133,77 @@ class ColorMLP(ColorPrecompute):
         color: torch.Tensor = self.color_activation(output)
         return color
 
+    def compose_input_batch(self, gaussians_list: list[GaussianModel], cameras: list[Camera]) -> torch.Tensor:
+        """Batched equivalent of compose_input: components that don't depend
+        on the camera (the base per-Gaussian feature vector, unaffected by
+        deformation) are computed once and broadcast; components that do
+        (view direction, non-rigid feature, per-frame latent) are stacked
+        per view. Returns (B,N,D_in)."""
+        B = len(gaussians_list)
+        base = gaussians_list[0]
+        features = base.get_features.squeeze(-1)                   # (N,D) -- identical across views
+        n_points = features.shape[0]
+        parts = [features.unsqueeze(0).expand(B, n_points, -1)]
+
+        if self.use_xyz:
+            aabb = self.metadata["aabb"]
+            xyz_b = torch.stack([aabb.normalize(g.get_xyz, sym=True) for g in gaussians_list])
+            parts.append(xyz_b)
+        if self.use_cov:
+            cov_b = torch.stack([g.get_covariance() for g in gaussians_list])
+            parts.append(cov_b)
+        if self.use_normal:
+            normals = []
+            for g in gaussians_list:
+                scale = g._scaling
+                rot = build_rotation(g._rotation)
+                normal = torch.gather(rot, dim=2, index=scale.argmin(1).reshape(-1, 1, 1).expand(-1, 3, 1)).squeeze(-1)
+                normals.append(normal)
+            parts.append(torch.stack(normals))
+        if self.sh_degree > 0:
+            dir_pps = []
+            for g, camera in zip(gaussians_list, cameras):
+                dir_pp = (g.get_xyz - camera.camera_center.repeat(n_points, 1))
+                if self.cano_view_dir:
+                    T_fwd = g.fwd_transform
+                    assert T_fwd is not None
+                    R_bwd = T_fwd[:, :3, :3].transpose(1, 2)
+                    dir_pp = torch.matmul(R_bwd, dir_pp.unsqueeze(-1)).squeeze(-1)
+                    view_noise_scale = self.cfg.view_noise
+                    if self.training and view_noise_scale > 0.:
+                        view_noise = torch.tensor(augm_rots(view_noise_scale, view_noise_scale, view_noise_scale),
+                                                  dtype=torch.float32,
+                                                  device=dir_pp.device).transpose(0, 1)
+                        dir_pp = torch.matmul(dir_pp, view_noise)
+                dir_pps.append(dir_pp)
+            dir_pp_b = torch.stack(dir_pps)                          # (B,N,3)
+            dir_pp_normalized = dir_pp_b / (dir_pp_b.norm(dim=-1, keepdim=True) + DIR_NORM_EPS)
+            dir_embed = self.sh_embed(dir_pp_normalized)             # (B,N,D_sh)
+            parts.append(dir_embed)
+        if self.non_rigid_dim > 0:
+            for g in gaussians_list:
+                assert g.non_rigid_feature is not None
+            nrf = torch.stack([g.non_rigid_feature for g in gaussians_list])  # (B,N,non_rigid_dim)
+            parts.append(nrf)
+        if self.latent_dim > 0:
+            idxs = [
+                self.frame_dict[camera.frame_id] if camera.frame_id in self.frame_dict else len(self.frame_dict) - 1
+                for camera in cameras
+            ]
+            latent_idx = torch.tensor(idxs, device=features.device).long()
+            latent_code = self.latent(latent_idx)                    # (B, latent_dim)
+            parts.append(latent_code.unsqueeze(1).expand(-1, n_points, -1))
+
+        return torch.cat(parts, dim=-1)
+
+    def forward_batch(self, gaussians_list: list[GaussianModel], cameras: list[Camera]) -> torch.Tensor:
+        """Batched equivalent of forward(): one MLP call over the whole
+        (B,N,D_in) input instead of one (N,D_in) call per view."""
+        inp = self.compose_input_batch(gaussians_list, cameras)
+        output = self.mlp(inp)
+        color: torch.Tensor = self.color_activation(output)
+        return color
+
 
 class GAAvatarRGB(ColorPrecompute):
     """GA-Avatar's RGBNet: a base MLP(F_tri) -> static color logit c_f and a

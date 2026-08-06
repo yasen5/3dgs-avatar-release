@@ -6,6 +6,13 @@ class 15 to ``Right_Hand``.  This script keeps those pixels for frames in the
 split's ``valid`` list, writes lossless PNG images with every other pixel set
 to exactly zero, and symlinks the selected frame's unchanged dataset files.
 
+Left/right hand disambiguation happens entirely here, at preprocessing time:
+alongside the combined ``hand_masks/`` (union of both hands, used for
+both-hands training), this script also writes ``hand_masks/left/`` and
+``hand_masks/right/`` -- each containing only that side's Sapiens class, so
+single-hand training at ``scripts/train.py`` just reads the matching
+directory instead of disambiguating hand blobs at every iteration.
+
 Run this script with the Python environment belonging to the local SapiensV2
 checkout, for example ``/path/to/scanner/.venv/bin/python``.
 """
@@ -24,7 +31,8 @@ import torch
 import torch.nn.functional as F
 
 
-HAND_CLASS_IDS = (6, 15)
+HAND_CLASS_IDS_BY_SIDE = {"left": 6, "right": 15}
+HAND_CLASS_IDS = tuple(HAND_CLASS_IDS_BY_SIDE.values())
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
 
@@ -134,7 +142,8 @@ class SapiensHandSegmenter:
             config.expanduser().resolve(), checkpoint.expanduser().resolve(), device=device
         )
 
-    def predict(self, image_bgr: np.ndarray) -> np.ndarray:
+    def predict(self, image_bgr: np.ndarray) -> dict[str, np.ndarray]:
+        """Per-side boolean hand masks, keyed by "left"/"right"."""
         data: Any = self.model.pipeline(dict(img=image_bgr))
         data = self.model.data_preprocessor(data)
         with torch.inference_mode():
@@ -143,7 +152,10 @@ class SapiensHandSegmenter:
                 logits, size=image_bgr.shape[:2], mode="bilinear", align_corners=False
             )
         labels = logits.argmax(dim=1)[0].cpu().numpy()
-        return np.isin(labels, HAND_CLASS_IDS)
+        return {
+            side: labels == class_id
+            for side, class_id in HAND_CLASS_IDS_BY_SIDE.items()
+        }
 
 
 def panel_tile(image: np.ndarray, mask: np.ndarray, masked: np.ndarray, frame_id: str) -> np.ndarray:
@@ -186,31 +198,46 @@ def main() -> int:
     output_camera = output_root / args.camera_name
     image_dir = output_camera / "images"
     mask_dir = output_camera / "hand_masks"
+    side_mask_dirs = {side: mask_dir / side for side in HAND_CLASS_IDS_BY_SIDE}
     image_dir.mkdir(parents=True, exist_ok=True)
     mask_dir.mkdir(parents=True, exist_ok=True)
+    for side_dir in side_mask_dirs.values():
+        side_dir.mkdir(parents=True, exist_ok=True)
     preview_rows: list[np.ndarray] = []
     frame_stats: list[dict[str, Any]] = []
 
     for index, frame_id in enumerate(frame_ids, start=1):
         output_image = image_dir / f"{frame_id}.png"
         output_mask = mask_dir / f"{frame_id}.png"
+        side_outputs = {side: d / f"{frame_id}.png" for side, d in side_mask_dirs.items()}
         original_path = source_image(source_camera / "images", frame_id)
         original = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
         if original is None:
             raise FileNotFoundError(original_path)
-        if output_image.exists() and output_mask.exists() and not args.overwrite:
+        existing = output_image.exists() and output_mask.exists() and all(
+            p.exists() for p in side_outputs.values()
+        )
+        if existing and not args.overwrite:
             hand_mask = cv2.imread(str(output_mask), cv2.IMREAD_GRAYSCALE) != 0
+            side_masks = {
+                side: cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) != 0
+                for side, p in side_outputs.items()
+            }
             masked = cv2.imread(str(output_image), cv2.IMREAD_COLOR)
             if masked is None:
                 raise FileNotFoundError(output_image)
         else:
-            hand_mask = segmenter.predict(original)
+            side_masks = segmenter.predict(original)
+            hand_mask = np.logical_or.reduce(list(side_masks.values()))
             if not hand_mask.any():
                 raise RuntimeError(f"SapiensV2 found no hand pixels in {frame_id}")
             masked = np.zeros_like(original)
             masked[hand_mask] = original[hand_mask]
             if not cv2.imwrite(str(output_mask), hand_mask.astype(np.uint8) * 255):
                 raise RuntimeError(f"Failed to write {output_mask}")
+            for side, side_mask in side_masks.items():
+                if not cv2.imwrite(str(side_outputs[side]), side_mask.astype(np.uint8) * 255):
+                    raise RuntimeError(f"Failed to write {side_outputs[side]}")
             if not cv2.imwrite(str(output_image), masked):
                 raise RuntimeError(f"Failed to write {output_image}")
         outside_nonzero = int(np.count_nonzero(masked[~hand_mask]))
@@ -218,15 +245,25 @@ def main() -> int:
             raise RuntimeError(
                 f"{output_image} has {outside_nonzero} nonzero values outside its hand mask"
             )
+        overlap = np.logical_and(side_masks["left"], side_masks["right"])
+        if overlap.any():
+            raise RuntimeError(
+                f"{frame_id}: left/right hand masks overlap on {int(overlap.sum())} pixels"
+            )
         fraction = float(hand_mask.mean())
-        frame_stats.append(
-            {"frame_id": frame_id, "hand_pixel_fraction": fraction, "outside_nonzero": 0}
-        )
+        frame_stats.append({
+            "frame_id": frame_id,
+            "hand_pixel_fraction": fraction,
+            "left_pixel_fraction": float(side_masks["left"].mean()),
+            "right_pixel_fraction": float(side_masks["right"].mean()),
+            "outside_nonzero": 0,
+        })
         if len(preview_rows) < args.panel_count:
             preview_rows.append(panel_tile(original, hand_mask, masked, frame_id))
         print(
             f"[{index:03d}/{len(frame_ids):03d}] {frame_id}: "
-            f"hand pixels={hand_mask.sum()} ({fraction:.5f})",
+            f"hand pixels={hand_mask.sum()} ({fraction:.5f}), "
+            f"left={side_masks['left'].sum()}, right={side_masks['right'].sum()}",
             flush=True,
         )
 
@@ -241,6 +278,8 @@ def main() -> int:
         "frame_ids": frame_ids,
         "hand_class_ids": list(HAND_CLASS_IDS),
         "hand_class_names": ["Left_Hand", "Right_Hand"],
+        "hand_class_ids_by_side": HAND_CLASS_IDS_BY_SIDE,
+        "mask_dirs_by_side": {side: f"hand_masks/{side}" for side in HAND_CLASS_IDS_BY_SIDE},
         "symlink_counts": link_counts,
         "frames": frame_stats,
     }
