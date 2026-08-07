@@ -23,6 +23,22 @@ import torch
 import trimesh
 
 
+# Body-part names accepted by BodyModel.body_part_vertex_mask()/
+# body_part_vertices(). Backends implement these by grouping their own joint
+# hierarchy; "left_hand"/"right_hand" are the same regions hand_vertex_mask()
+# selects (with both sides combined).
+BODY_PARTS: tuple[str, ...] = (
+    "head",
+    "torso",
+    "left_arm",
+    "right_arm",
+    "left_leg",
+    "right_leg",
+    "left_hand",
+    "right_hand",
+)
+
+
 class BodyModel(ABC):
     _hand_only: bool = False
     _hand_side: str | None = None
@@ -203,6 +219,36 @@ class BodyModel(ABC):
         finally:
             self._hand_only = was_hand_only
         return vertices[self.hand_vertex_mask().to(vertices.device)]
+
+    # --- Body-part reporting -------------------------------------------------
+    #
+    # A coarser, read-only counterpart to the hand-only training-region
+    # interface above: instead of restricting what a body model *exposes*
+    # (set_hand_only), this just answers "which canonical vertices belong to
+    # part X" for any of BODY_PARTS, for tooling (e.g.
+    # scripts/prepare_sapiens_hand_dataset.py) that needs a per-body-part
+    # vertex selection without driving hand-only training.
+
+    def body_part_vertex_mask(self, part: str) -> torch.Tensor:
+        """Boolean mask over the backend's full canonical vertex topology,
+        True for vertices belonging to ``part`` (one of BODY_PARTS).
+
+        Backends which support body-part reporting must override this
+        method.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose body-part vertex selection"
+        )
+
+    def body_part_vertices(self, part: str) -> torch.Tensor:
+        """Exactly the canonical vertices belonging to ``part``."""
+        was_hand_only = self._hand_only
+        self._hand_only = False
+        try:
+            vertices = self.rest_vertices()
+        finally:
+            self._hand_only = was_hand_only
+        return vertices[self.body_part_vertex_mask(part).to(vertices.device)]
 
     def freeze_non_hand_pose(self, pose_params: torch.Tensor) -> torch.Tensor:
         """Keep pose values unchanged while blocking non-hand gradients.

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Dry-run selection of MHR frames whose hands are not occluded by the body.
+"""Dry-run selection of MHR frames whose given body part is not occluded by
+the rest of the body.
 
-For every hand vertex, the script tests its camera ray against every non-hand
-mesh face.  A frame is valid only when every hand vertex is in the image and
-no non-hand face is closer along that camera ray.  Hand vertices are derived
-from the MHR skinning weights, using the two palm/finger subtrees rooted at
-joints 42 and 78.
+For every vertex of ``--body-part``, the script tests its camera ray against
+every mesh face outside that part.  A frame is valid only when every such
+vertex is in the image and no outside face is closer along that camera ray.
+Body-part vertices are derived from the MHR skinning weights via
+``src.body_models.mhr_body_model.body_part_joints`` -- the same joint groups
+``BodyModel.body_part_vertex_mask`` uses. Lateral parts (hand/arm/leg) report
+per-side occlusion; head/torso are a single region.
 
 The dataset is never modified.  The output directory receives ``split.json``,
 ``valid.txt``, ``invalid.txt``, and a diagnostic ``panel.png``.
@@ -15,7 +18,8 @@ Example::
     python scripts/select_unoccluded_hands.py \
         --input-root /path/to/CoreView_377/Camera_B1 \
         --mhr-model /path/to/mhr_model.pt \
-        --output-dir output/hand_visibility
+        --output-dir output/hand_visibility \
+        --body-part hand
 """
 from __future__ import annotations
 
@@ -35,12 +39,19 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from src.body_models import mhr_lbs
+from src.body_models.mhr_body_model import body_part_joints
 
-
-# These are the complete palm/finger subtrees in MHR's 127-joint hierarchy.
-# The wrist/forearm joints immediately preceding them are 41 and 77.
-LEFT_HAND_JOINTS = tuple(range(42, 65))
-RIGHT_HAND_JOINTS = tuple(range(78, 101))
+# Region names (for the split/panel output and per-region occlusion counts)
+# per --body-part, mapped to the BodyModel.body_part_vertex_mask() part name
+# that supplies each region's joints. Lateral parts report left/right
+# separately; head/torso are a single region.
+BODY_PART_SIDES: dict[str, dict[str, str]] = {
+    "hand": {"left": "left_hand", "right": "right_hand"},
+    "arm": {"left": "left_arm", "right": "right_arm"},
+    "leg": {"left": "left_leg", "right": "right_leg"},
+    "head": {"part": "head"},
+    "torso": {"part": "torso"},
+}
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
 
@@ -48,20 +59,20 @@ IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 class FrameResult:
     frame_id: str
     valid: bool
-    hand_vertices: int
+    part_vertices: int
     occluded_vertices: int
     outside_vertices: int
-    left_occluded_vertices: int
-    right_occluded_vertices: int
+    region_occluded_vertices: dict[str, int]
 
 
 @dataclass(frozen=True)
 class FrameDebug:
     image_path: Path
-    projected_hand: npt.NDArray[np.float32]
+    projected: npt.NDArray[np.float32]
     occluded: npt.NDArray[np.bool_]
     outside: npt.NDArray[np.bool_]
-    left_count: int
+    region_id: npt.NDArray[np.int64]
+    region_names: list[str]
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,21 +99,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
+        "--body-part",
+        default="hand",
+        choices=sorted(BODY_PART_SIDES),
+        help="Body part whose occlusion to check (default: hand).",
+    )
+    parser.add_argument(
         "--hand-weight-threshold",
         type=float,
         default=0.5,
-        help="Minimum summed hand-joint skinning weight for a hand vertex (default: 0.5).",
+        help="Minimum summed body-part-joint skinning weight for a vertex to count (default: 0.5).",
     )
     parser.add_argument(
         "--depth-tolerance-mm",
         type=float,
         default=2.0,
-        help="Ignore non-hand depth differences no larger than this (default: 2 mm).",
+        help="Ignore outside-part depth differences no larger than this (default: 2 mm).",
     )
     parser.add_argument(
         "--allow-outside",
         action="store_true",
-        help="Do not invalidate a frame when hand vertices project outside the image.",
+        help="Do not invalidate a frame when body-part vertices project outside the image.",
     )
     parser.add_argument(
         "--device",
@@ -163,39 +180,29 @@ def image_for(image_dir: Path, frame_id: str) -> Path:
     raise FileNotFoundError(f"No source image for {frame_id} in {image_dir}")
 
 
-def descendants(parents: npt.NDArray[np.integer], root: int) -> tuple[int, ...]:
-    result = {root}
-    changed = True
-    while changed:
-        changed = False
-        for joint, parent in enumerate(parents):
-            if joint not in result and int(parent) in result:
-                result.add(joint)
-                changed = True
-    return tuple(sorted(result))
-
-
-def hand_vertex_masks(
-    model_path: Path, threshold: float
-) -> tuple[npt.NDArray[np.bool_], npt.NDArray[np.bool_]]:
+def body_part_vertex_masks(
+    model_path: Path, body_part: str, threshold: float
+) -> dict[str, npt.NDArray[np.bool_]]:
+    """Per-region boolean vertex masks for ``body_part`` (one of BODY_PART_SIDES)."""
     state = mhr_lbs.mhr_state_dict(str(model_path.expanduser().resolve()))
     parents = mhr_lbs.joint_parents(state).cpu().numpy()
-    left_joints = descendants(parents, LEFT_HAND_JOINTS[0])
-    right_joints = descendants(parents, RIGHT_HAND_JOINTS[0])
-    if left_joints != LEFT_HAND_JOINTS or right_joints != RIGHT_HAND_JOINTS:
-        raise ValueError(
-            "The checkpoint's joint hierarchy does not match the supported MHR rig: "
-            f"left={left_joints}, right={right_joints}"
-        )
     weights = mhr_lbs.dense_skinning_weights(state).cpu().numpy()
-    left = weights[:, left_joints].sum(axis=1) >= threshold
-    right = weights[:, right_joints].sum(axis=1) >= threshold
-    if not left.any() or not right.any() or np.any(left & right):
-        raise ValueError(
-            f"Invalid hand masks from {model_path}: left={left.sum()}, "
-            f"right={right.sum()}, overlap={(left & right).sum()}"
-        )
-    return left, right
+    masks = {
+        region: weights[:, list(body_part_joints(parents, part_name))].sum(axis=1) >= threshold
+        for region, part_name in BODY_PART_SIDES[body_part].items()
+    }
+    empty = {region: int(mask.sum()) for region, mask in masks.items() if not mask.any()}
+    if empty:
+        raise ValueError(f"Empty {body_part} region mask(s) from {model_path}: {empty}")
+    names = list(masks)
+    for i, region_a in enumerate(names):
+        for region_b in names[i + 1 :]:
+            overlap = masks[region_a] & masks[region_b]
+            if overlap.any():
+                raise ValueError(
+                    f"{region_a}/{region_b} vertex masks overlap on {int(overlap.sum())} vertices"
+                )
+    return masks
 
 
 def project(
@@ -293,8 +300,7 @@ def rays_hit_before_vertices(
 def classify_frame(
     raw_path: Path,
     image_dir: Path,
-    left_mask: npt.NDArray[np.bool_],
-    right_mask: npt.NDArray[np.bool_],
+    region_masks: dict[str, npt.NDArray[np.bool_]],
     depth_tolerance: float,
     allow_outside: bool,
     device: torch.device,
@@ -314,7 +320,9 @@ def classify_frame(
         width = int(np.asarray(raw["width"]).reshape(()))
         height = int(np.asarray(raw["height"]).reshape(()))
 
-    if len(vertices) != len(left_mask) or faces.max(initial=-1) >= len(vertices):
+    region_names = list(region_masks)
+    any_mask = region_masks[region_names[0]]
+    if len(vertices) != len(any_mask) or faces.max(initial=-1) >= len(vertices):
         raise ValueError(f"Mesh topology in {raw_path} does not match the MHR checkpoint")
     image_path = image_for(image_dir, raw_path.stem)
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -324,25 +332,28 @@ def classify_frame(
             f"image={None if image is None else image.shape[:2]}, raw={(height, width)}"
         )
 
-    hand_mask = left_mask | right_mask
-    hand_indices = np.concatenate((np.flatnonzero(left_mask), np.flatnonzero(right_mask)))
-    left_count = int(left_mask.sum())
+    part_mask = np.logical_or.reduce([region_masks[name] for name in region_names])
+    region_index_lists = [np.flatnonzero(region_masks[name]) for name in region_names]
+    part_indices = np.concatenate(region_index_lists)
+    region_id = np.concatenate(
+        [np.full(len(idx), i, dtype=np.int64) for i, idx in enumerate(region_index_lists)]
+    )
     uv = project(vertices, focal, width, height)
-    hand_uv = uv[hand_indices]
-    hand_z = vertices[hand_indices, 2]
-    finite = np.isfinite(hand_uv).all(axis=1)
-    px = np.rint(np.nan_to_num(hand_uv[:, 0], nan=-1.0)).astype(np.int64)
-    py = np.rint(np.nan_to_num(hand_uv[:, 1], nan=-1.0)).astype(np.int64)
-    inside = finite & (hand_z > 0) & (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    part_uv = uv[part_indices]
+    part_z = vertices[part_indices, 2]
+    finite = np.isfinite(part_uv).all(axis=1)
+    px = np.rint(np.nan_to_num(part_uv[:, 0], nan=-1.0)).astype(np.int64)
+    py = np.rint(np.nan_to_num(part_uv[:, 1], nan=-1.0)).astype(np.int64)
+    inside = finite & (part_z > 0) & (px >= 0) & (px < width) & (py >= 0) & (py < height)
     outside = ~inside
 
-    non_hand_faces = faces[~hand_mask[faces].all(axis=1)]
-    occluded = np.zeros(len(hand_indices), dtype=bool)
+    outside_part_faces = faces[~part_mask[faces].all(axis=1)]
+    occluded = np.zeros(len(part_indices), dtype=bool)
     inside_indices = np.flatnonzero(inside)
     occluded[inside_indices] = rays_hit_before_vertices(
-        vertices[hand_indices[inside_indices]],
+        vertices[part_indices[inside_indices]],
         vertices,
-        non_hand_faces,
+        outside_part_faces,
         depth_tolerance,
         device,
     )
@@ -351,13 +362,14 @@ def classify_frame(
     result = FrameResult(
         frame_id=raw_path.stem,
         valid=not invalid,
-        hand_vertices=len(hand_indices),
+        part_vertices=len(part_indices),
         occluded_vertices=int(occluded.sum()),
         outside_vertices=int(outside.sum()),
-        left_occluded_vertices=int(occluded[:left_count].sum()),
-        right_occluded_vertices=int(occluded[left_count:].sum()),
+        region_occluded_vertices={
+            name: int(occluded[region_id == i].sum()) for i, name in enumerate(region_names)
+        },
     )
-    debug = FrameDebug(image_path, hand_uv, occluded, outside, left_count)
+    debug = FrameDebug(image_path, part_uv, occluded, outside, region_id, region_names)
     return result, debug
 
 
@@ -366,6 +378,10 @@ def evenly_spaced(items: list[int], count: int) -> list[int]:
         return items
     positions = np.linspace(0, len(items) - 1, count).round().astype(int)
     return [items[i] for i in positions]
+
+
+# Green first: a single-region part (e.g. head) is drawn entirely green.
+REGION_COLORS = [(70, 220, 70), (255, 190, 30), (180, 105, 255), (0, 200, 255)]
 
 
 def draw_tile(
@@ -380,17 +396,16 @@ def draw_tile(
         (tile_width, max(1, round(image.shape[0] * scale))),
         interpolation=cv2.INTER_AREA,
     )
-    points = np.rint(debug.projected_hand * scale).astype(np.int32)
+    points = np.rint(debug.projected * scale).astype(np.int32)
     for index, point in enumerate(points):
         x, y = int(point[0]), int(point[1])
         if not (0 <= x < tile.shape[1] and 0 <= y < tile.shape[0]):
             continue
         if debug.occluded[index]:
             color, radius = (0, 0, 255), 2
-        elif index < debug.left_count:
-            color, radius = (70, 220, 70), 1
         else:
-            color, radius = (255, 190, 30), 1
+            color = REGION_COLORS[int(debug.region_id[index]) % len(REGION_COLORS)]
+            radius = 1
         cv2.circle(tile, (x, y), radius, color, -1, cv2.LINE_AA)
     status = "VALID" if result.valid else "INVALID"
     status_color = (40, 190, 40) if result.valid else (30, 30, 220)
@@ -464,9 +479,10 @@ def main() -> None:
     if not raw_paths:
         raise FileNotFoundError(f"No matching .npz fits in {raw_dir}")
 
-    left_mask, right_mask = hand_vertex_masks(args.mhr_model, args.hand_weight_threshold)
+    region_masks = body_part_vertex_masks(args.mhr_model, args.body_part, args.hand_weight_threshold)
+    region_summary = ", ".join(f"{name}={mask.sum()}" for name, mask in region_masks.items())
     print(
-        f"Hand mask: {left_mask.sum()} left + {right_mask.sum()} right vertices "
+        f"{args.body_part} mask: {region_summary} vertices "
         f"(weight threshold {args.hand_weight_threshold:g})"
     )
     results: list[FrameResult] = []
@@ -474,7 +490,7 @@ def main() -> None:
     tolerance = args.depth_tolerance_mm / 1000.0
     for index, raw_path in enumerate(raw_paths, start=1):
         result, frame_debug = classify_frame(
-            raw_path, image_dir, left_mask, right_mask, tolerance,
+            raw_path, image_dir, region_masks, tolerance,
             args.allow_outside, device,
         )
         results.append(result)
@@ -494,6 +510,7 @@ def main() -> None:
         "dry_run": True,
         "input_root": str(cam_dir),
         "mhr_model": str(args.mhr_model.expanduser().resolve()),
+        "body_part": args.body_part,
         "criterion": {
             "hand_weight_threshold": args.hand_weight_threshold,
             "depth_tolerance_mm": args.depth_tolerance_mm,

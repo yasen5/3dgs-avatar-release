@@ -25,7 +25,7 @@ from omegaconf import DictConfig
 from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 
 from src.body_models import mhr_lbs
-from src.body_models.base import BodyModel
+from src.body_models.base import BODY_PARTS, BodyModel
 from src.body_models.mhr_lbs import MHRQueryOutput
 from src.constants import (
     MHR_HAND_DIMS,
@@ -47,6 +47,59 @@ _RIGHT_HAND_JOINTS = tuple(range(78, 101))
 # joint that hand_joint_mask (pose-encoder context) also needs.
 _LEFT_HAND_JOINT_MASK = tuple(range(41, 65))
 _RIGHT_HAND_JOINT_MASK = tuple(range(77, 101))
+
+# Body-part joint groups for the same 127-joint rig, derived from
+# character_torch.skeleton.joint_parents and confirmed against the rig's
+# canonical joint_pos (mhr_lbs.mhr_query with zero pose): joint 1 (pelvis)
+# has exactly three children -- 2 (right hip), 18 (left hip), 34 (spine,
+# going up to chest/neck) -- and joint 37 (neck) has exactly three children
+# -- 38 (left shoulder), 74 (right shoulder), 110 (head/jaw/eyes). Arm groups
+# subtract the hand subtree so hand_only selection stays exact.
+_RIGHT_LEG_ROOT = 2
+_LEFT_LEG_ROOT = 18
+_LEFT_ARM_ROOT = 38
+_RIGHT_ARM_ROOT = 74
+_HEAD_ROOT = 110
+_TORSO_JOINTS = (0, 1, 34, 35, 36, 37)
+
+
+def _descendants(parents: npt.NDArray[np.integer[Any]], root: int) -> tuple[int, ...]:
+    """All joints reachable from `root` by following `parents`, `root` included."""
+    result = {root}
+    changed = True
+    while changed:
+        changed = False
+        for joint, parent in enumerate(parents):
+            if joint not in result and int(parent) in result:
+                result.add(joint)
+                changed = True
+    return tuple(sorted(result))
+
+
+def body_part_joints(parents: npt.NDArray[np.integer[Any]], part: str) -> tuple[int, ...]:
+    """Joint indices making up ``part`` (one of BODY_PARTS) in the 127-joint rig.
+
+    Standalone from MHRBodyModel so tooling that only has a raw skinning-weight
+    matrix (e.g. scripts/select_unoccluded_hands.py) can reuse the same joint
+    groups without constructing a full body model.
+    """
+    if part == "left_hand":
+        return _LEFT_HAND_JOINTS
+    if part == "right_hand":
+        return _RIGHT_HAND_JOINTS
+    if part == "left_leg":
+        return _descendants(parents, _LEFT_LEG_ROOT)
+    if part == "right_leg":
+        return _descendants(parents, _RIGHT_LEG_ROOT)
+    if part == "left_arm":
+        return tuple(set(_descendants(parents, _LEFT_ARM_ROOT)) - set(_LEFT_HAND_JOINTS))
+    if part == "right_arm":
+        return tuple(set(_descendants(parents, _RIGHT_ARM_ROOT)) - set(_RIGHT_HAND_JOINTS))
+    if part == "head":
+        return _descendants(parents, _HEAD_ROOT)
+    if part == "torso":
+        return _TORSO_JOINTS
+    raise ValueError(f"Unknown body part {part!r}, expected one of {BODY_PARTS}")
 
 
 def _tensor_config_value(
@@ -243,6 +296,11 @@ class MHRBodyModel(BodyModel, nn.Module):
         else:
             mask[[*_LEFT_HAND_JOINT_MASK, *_RIGHT_HAND_JOINT_MASK]] = True
         return mask
+
+    def body_part_vertex_mask(self, part: str) -> torch.Tensor:
+        parents = self._joint_parents.detach().cpu().numpy()
+        joints = body_part_joints(parents, part)
+        return self._skinning_weights[:, list(joints)].sum(dim=1) >= 0.5
 
     def pose_transforms(
         self, pose_params: torch.Tensor

@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 import trimesh
 from omegaconf import DictConfig
-from src.body_models.base import BodyModel
+from src.body_models.base import BODY_PARTS, BodyModel
 
 
 class SMPLXBodyModel(BodyModel, nn.Module):
@@ -203,6 +203,42 @@ class SMPLXBodyModel(BodyModel, nn.Module):
 
     def hand_joint_mask(self) -> torch.Tensor:
         return self.hand_pose_parameter_mask().reshape(-1, 3).any(dim=1)
+
+    # Standard SMPL-X joint ordering (55 joints): 0 pelvis, 1/2 hips, 3/6/9
+    # spine1-3, 4/5 knees, 7/8 ankles, 10/11 feet, 12 neck, 13/14 collars, 15
+    # head, 16/17 shoulders, 18/19 elbows, 20/21 wrists (= _LEFT/RIGHT_HAND_
+    # JOINTS' wrist entries), 22 jaw, 23/24 eyes, 25..54 finger joints (also
+    # in _LEFT/RIGHT_HAND_JOINTS). Arms stop at the elbow so they don't
+    # overlap the hand joints above; the neck stays with the torso so "head"
+    # is exactly the head/jaw/eyes group.
+    _LEFT_ARM_JOINTS = (16, 18)
+    _RIGHT_ARM_JOINTS = (17, 19)
+    _LEFT_LEG_JOINTS = (1, 4, 7, 10)
+    _RIGHT_LEG_JOINTS = (2, 5, 8, 11)
+    _HEAD_JOINTS = (15, 22, 23, 24)
+    _TORSO_JOINTS = (0, 3, 6, 9, 12, 13, 14)
+
+    def body_part_vertex_mask(self, part: str) -> torch.Tensor:
+        self._assert_built()
+        if part == "left_hand":
+            joints = self._LEFT_HAND_JOINTS
+        elif part == "right_hand":
+            joints = self._RIGHT_HAND_JOINTS
+        elif part == "left_arm":
+            joints = self._LEFT_ARM_JOINTS
+        elif part == "right_arm":
+            joints = self._RIGHT_ARM_JOINTS
+        elif part == "left_leg":
+            joints = self._LEFT_LEG_JOINTS
+        elif part == "right_leg":
+            joints = self._RIGHT_LEG_JOINTS
+        elif part == "head":
+            joints = self._HEAD_JOINTS
+        elif part == "torso":
+            joints = self._TORSO_JOINTS
+        else:
+            raise ValueError(f"Unknown body part {part!r}, expected one of {BODY_PARTS}")
+        return self._subdiv_lbs_weights[:, list(joints)].sum(dim=1) >= 0.5
 
     def set_hand_only(self, enabled: bool = True, side: str | None = None) -> None:
         super().set_hand_only(enabled, side)

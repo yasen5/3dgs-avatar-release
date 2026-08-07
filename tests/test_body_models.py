@@ -115,6 +115,32 @@ def test_hand_interface_exposes_exact_vertices_and_freezes_other_pose_gradients(
     assert torch.equal(pose.grad, torch.tensor([[0.0, 1.0]]))
 
 
+class _ToyBodyPartBodyModel(_ToyBodyModel):
+    def body_part_vertex_mask(self, part: str) -> torch.Tensor:
+        if part == "left_hand":
+            return torch.tensor([False, True])
+        raise ValueError(part)
+
+
+def test_body_part_vertex_mask_defaults_to_not_implemented() -> None:
+    model = _ToyBodyModel()
+    try:
+        model.body_part_vertex_mask("head")
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("expected NotImplementedError for a backend without body parts")
+
+
+def test_body_part_vertices_selects_from_full_topology_regardless_of_hand_only() -> None:
+    model = _ToyBodyPartBodyModel()
+    model._hand_only = True  # simulate hand-only mode without a full hand implementation
+
+    assert torch.equal(model.body_part_vertices("left_hand"), torch.tensor([[1.0, 0.0, 0.0]]))
+    # hand_only must still be in effect afterwards.
+    assert model.hand_only
+
+
 def test_hand_face_selection_remaps_to_compact_topology() -> None:
     faces = np.array([[0, 1, 2], [1, 2, 3], [0, 2, 3]], dtype=np.int64)
     selected = BodyModel.select_vertex_faces(

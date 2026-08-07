@@ -44,7 +44,7 @@ def test_main_writes_split_left_right_masks_and_manifest(tmp_path: Path, monkeyp
 
     output_root = tmp_path / "output"
     monkeypatch.setattr(
-        prep, "SapiensHandSegmenter", lambda *args, **kwargs: _FakeSegmenter()
+        prep, "SapiensBodyPartSegmenter", lambda *args, **kwargs: _FakeSegmenter()
     )
     monkeypatch.setattr(prep.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
@@ -76,8 +76,9 @@ def test_main_writes_split_left_right_masks_and_manifest(tmp_path: Path, monkeyp
         assert (right != 0).any()
 
     manifest = json.loads((output_root / "hand_dataset_manifest.json").read_text())
-    assert manifest["hand_class_ids_by_side"] == {"left": 6, "right": 15}
-    assert manifest["mask_dirs_by_side"] == {"left": "hand_masks/left", "right": "hand_masks/right"}
+    assert manifest["body_part"] == "hand"
+    assert manifest["class_ids_by_region"] == {"left": [6], "right": [15]}
+    assert manifest["mask_dirs_by_region"] == {"left": "hand_masks/left", "right": "hand_masks/right"}
     assert {frame["frame_id"] for frame in manifest["frames"]} == set(frame_ids)
     for frame in manifest["frames"]:
         assert frame["left_pixel_fraction"] > 0
@@ -100,7 +101,7 @@ def test_main_rejects_overlapping_left_right_masks(tmp_path: Path, monkeypatch) 
             return {"left": both, "right": both}
 
     monkeypatch.setattr(
-        prep, "SapiensHandSegmenter", lambda *args, **kwargs: _OverlappingSegmenter()
+        prep, "SapiensBodyPartSegmenter", lambda *args, **kwargs: _OverlappingSegmenter()
     )
     monkeypatch.setattr(prep.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(

@@ -1,15 +1,15 @@
 import numpy as np
 
 from scripts.select_unoccluded_hands import (
-    descendants,
     ray_hits_before_vertex,
     rays_hit_before_vertices,
 )
+from src.body_models.mhr_body_model import _descendants
 
 
 def test_descendants_returns_only_the_requested_joint_subtree():
     parents = np.array([-1, 0, 0, 1, 1, 2, 3], dtype=np.int64)
-    assert descendants(parents, 1) == (1, 3, 4, 6)
+    assert _descendants(parents, 1) == (1, 3, 4, 6)
 
 
 def test_ray_hit_must_be_strictly_before_the_hand_vertex():
