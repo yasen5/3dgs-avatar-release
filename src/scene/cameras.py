@@ -42,6 +42,7 @@ class Camera:
         colmap_id: int | None = None,
         uid: int | None = None,
         align_matrix: torch.Tensor | None = None,
+        mhr_model_params: torch.Tensor | None = None,
     ) -> None:
         self.frame_id = frame_id
         self.cam_id = cam_id
@@ -68,6 +69,10 @@ class Camera:
         # camera.bone_transforms computed once at dataset-load time. None for
         # datasets that don't need this (MHR).
         self.align_matrix = align_matrix
+        # Keep the original MHR parameterization alongside the derived joint
+        # rotations/transforms.  The 127-joint rotation tensor is not enough
+        # to evaluate MHR's internal per-vertex pose correctives.
+        self.mhr_model_params = mhr_model_params
 
         self.trans: npt.NDArray[np.floating[Any]] = np.array([0.0, 0.0, 0.0])
         self.scale: float = 1.0
@@ -101,6 +106,8 @@ class Camera:
         self.bone_transforms = self.bone_transforms.to(self.data_device, non_blocking=True)
         if self.align_matrix is not None:
             self.align_matrix = self.align_matrix.to(self.data_device, non_blocking=True)
+        if self.mhr_model_params is not None:
+            self.mhr_model_params = self.mhr_model_params.to(self.data_device, non_blocking=True)
 
     def copy(self) -> Camera:
         return copy_module.copy(self)
@@ -110,14 +117,19 @@ class Camera:
         *,
         rots: torch.Tensor | None = None,
         bone_transforms: torch.Tensor | None = None,
+        mhr_model_params: torch.Tensor | None = None,
     ) -> None:
         if rots is not None:
             self.rots = rots
         if bone_transforms is not None:
             self.bone_transforms = bone_transforms
+        if mhr_model_params is not None:
+            self.mhr_model_params = mhr_model_params
 
     def merge(self, cam: Camera) -> None:
         self.frame_id = cam.frame_id
         self.rots = cam.rots.detach()
         self.Jtrs = cam.Jtrs.detach()
         self.bone_transforms = cam.bone_transforms.detach()
+        if cam.mhr_model_params is not None:
+            self.mhr_model_params = cam.mhr_model_params.detach()

@@ -67,6 +67,28 @@ def test_lbs_accepts_custom_and_batched_weights() -> None:
     assert torch.allclose(posed[1], expected_one)
 
 
+class _ToyResidualBodyModel(_ToyBodyModel):
+    def pose_residuals(self, pose_params: torch.Tensor) -> torch.Tensor:
+        if pose_params.ndim == 1:
+            pose_params = pose_params.unsqueeze(0)
+        residual = torch.tensor(
+            [[0.0, 0.5, 0.0], [-0.25, 0.0, 0.0]],
+            dtype=self._vertices.dtype,
+            device=self._vertices.device,
+        )
+        return residual.unsqueeze(0).expand(pose_params.shape[0], -1, -1)
+
+
+def test_lbs_adds_backend_pose_residuals() -> None:
+    model = _ToyResidualBodyModel()
+
+    posed = model.lbs(torch.zeros(1))
+
+    expected = torch.tensor([[0.0, 0.5, 0.0], [2.75, 0.0, 0.0]])
+    assert posed.shape == (2, 3)
+    assert torch.allclose(posed, expected)
+
+
 class _ToyHandBodyModel(_ToyBodyModel):
     def hand_vertex_mask(self) -> torch.Tensor:
         return torch.tensor([False, True])

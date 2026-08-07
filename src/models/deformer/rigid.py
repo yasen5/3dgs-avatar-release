@@ -42,6 +42,9 @@ class SkinningField(RigidDeform):
         self.aabb = metadata["aabb"]
         self.faces = metadata["faces"]
         self.cano_mesh = metadata["cano_mesh"]
+        # Borrow the body model without registering it twice as a submodule;
+        # it owns MHR's frozen rig and any trainable pose/CTO parameters.
+        self._body_model: list[object] = [metadata.get("body_model", None)]
 
         self.distill: bool = cfg.distill
         d, h, w = cfg.res // cfg.z_ratio, cfg.res, cfg.res
@@ -59,6 +62,28 @@ class SkinningField(RigidDeform):
         cano_verts_t = torch.from_numpy(self.cano_verts).float()
         self.register_buffer("cano_verts_norm", self.aabb.normalize(cano_verts_t, sym=True))
         self.register_buffer("skinning_weights_t", torch.from_numpy(self.skinning_weights).float())
+
+    @property
+    def body_model(self):  # type: ignore[no-untyped-def]
+        return self._body_model[0]
+
+    def _pose_residuals(self, camera: Camera) -> torch.Tensor | None:
+        model_params = getattr(camera, "mhr_model_params", None)
+        if self.body_model is None or model_params is None:
+            return None
+        return self.body_model.pose_residuals(model_params)
+
+    def _nearest_canonical_indices(self, xyz_norm: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            _, idx, _ = knn_points(xyz_norm[None], self.cano_verts_norm[None], K=1)
+        return idx.reshape(-1)
+
+    def _nearest_canonical_indices_batched(self, xyz_norm_b: torch.Tensor) -> torch.Tensor:
+        B = xyz_norm_b.shape[0]
+        with torch.no_grad():
+            cano_verts_b = self.cano_verts_norm.unsqueeze(0).expand(B, -1, -1).contiguous()
+            _, idx, _ = knn_points(xyz_norm_b, cano_verts_b, K=1)
+        return idx.reshape(B, -1)
 
 
     def precompute(self, recompute_skinning: bool = True) -> None:
@@ -78,9 +103,8 @@ class SkinningField(RigidDeform):
         mesh vertex (Eq. 7 in 3dga_paper.txt), instead of predicting the full
         weight distribution from scratch. The nearest-neighbor lookup is
         non-differentiable; only the offset MLP receives gradient."""
-        with torch.no_grad():
-            _, idx, _ = knn_points(xyz_norm[None], self.cano_verts_norm[None], K=1)
-        default_w = self.skinning_weights_t[idx.view(-1)]
+        idx = self._nearest_canonical_indices(xyz_norm)
+        default_w = self.skinning_weights_t[idx]
         offset_logits = self.lbs_network(xyz_norm)
         pts_W = self.softmax(torch.log(default_w + 1e-9) + offset_logits)
         return pts_W
@@ -94,10 +118,8 @@ class SkinningField(RigidDeform):
         batch instead of once per view. Not used when distill=True (no
         caller needs that combination yet)."""
         B, N, _ = xyz_norm_b.shape
-        with torch.no_grad():
-            cano_verts_b = self.cano_verts_norm.unsqueeze(0).expand(B, -1, -1).contiguous()
-            _, idx, _ = knn_points(xyz_norm_b, cano_verts_b, K=1)
-        default_w = self.skinning_weights_t[idx.view(B, N)]        # (B,N,J)
+        idx = self._nearest_canonical_indices_batched(xyz_norm_b)
+        default_w = self.skinning_weights_t[idx]        # (B,N,J)
         offset_logits = self.lbs_network(xyz_norm_b)                # (B,N,J)
         pts_W = self.softmax(torch.log(default_w + 1e-9) + offset_logits)
         return pts_W
@@ -129,6 +151,20 @@ class SkinningField(RigidDeform):
         homo_coord = torch.ones(B, n_pts, 1, dtype=torch.float32, device=xyz_b.device)
         x_hat_homo = torch.cat([xyz_b, homo_coord], dim=-1)                 # (B,N,4)
         x_bar = torch.einsum("bnij,bnj->bni", T_fwd_b, x_hat_homo)         # (B,N,4)
+
+        if self.body_model is not None and all(
+            getattr(camera, "mhr_model_params", None) is not None for camera in cameras
+        ):
+            model_params = torch.cat(
+                [camera.mhr_model_params for camera in cameras], dim=0
+            )
+            residuals = self.body_model.pose_residuals(model_params)
+            residual_idx = self._nearest_canonical_indices_batched(xyz_norm_b)
+            batch_idx = torch.arange(B, device=residual_idx.device).unsqueeze(1)
+            corrected_xyz = x_bar[:, :, :3] + residuals[batch_idx, residual_idx].to(
+                device=x_bar.device, dtype=x_bar.dtype
+            )
+            x_bar = torch.cat([corrected_xyz, x_bar[:, :, 3:]], dim=-1)
 
         rotation_hat_b = torch.stack([build_rotation(g._rotation) for g in gaussians_list])  # (B,N,3,3)
         rotation_bar = torch.einsum("bnij,bnjk->bnik", T_fwd_b[:, :, :3, :3], rotation_hat_b)  # (B,N,3,3)
@@ -203,6 +239,10 @@ class SkinningField(RigidDeform):
         homo_coord = torch.ones(n_pts, 1, dtype=torch.float32, device=xyz.device)
         x_hat_homo = torch.cat([xyz, homo_coord], dim=-1).view(n_pts, 4, 1)
         x_bar = torch.matmul(T_fwd, x_hat_homo)[:, :3, 0]
+        residuals = self._pose_residuals(camera)
+        if residuals is not None:
+            residual_idx = self._nearest_canonical_indices(xyz_norm)
+            x_bar = x_bar + residuals[0, residual_idx]
         deformed_gaussians._xyz = x_bar
 
         rotation_hat = build_rotation(gaussians._rotation)
@@ -285,6 +325,10 @@ class VertexLBS(RigidDeform):
         homo_coord = torch.ones(n_pts, 1, dtype=torch.float32, device=xyz.device)
         x_hat_homo = torch.cat([xyz, homo_coord], dim=-1).view(n_pts, 4, 1)
         x_bar = torch.matmul(T_fwd, x_hat_homo)[:, :3, 0]
+        model_params = getattr(camera, "mhr_model_params", None)
+        if self.body_model is not None and model_params is not None:
+            residuals = self.body_model.pose_residuals(model_params)
+            x_bar = x_bar + residuals[0].to(device=x_bar.device, dtype=x_bar.dtype)
         deformed_gaussians._xyz = x_bar
 
         rotation_hat = build_rotation(gaussians._rotation)

@@ -317,6 +317,39 @@ class MHRBodyModel(BodyModel, nn.Module):
         )
         return target["joint_pos"], target["joint_rotmat"], transforms
 
+    def pose_residuals(self, pose_params: torch.Tensor) -> torch.Tensor:
+        """Return MHR's target-pose corrective residual over rigid LBS.
+
+        MHR's TorchScript forward returns the corrective-inclusive target
+        mesh, but the shared renderer consumes only canonical vertices,
+        weights, and joint transforms.  Reconstruct the latter here and keep
+        the difference as an explicit per-vertex offset.  The residual is
+        expressed in MHR's repository/world coordinate convention, but does
+        not include the dataset camera translation (that translation belongs
+        to the per-joint transforms).
+        """
+        target = self._query(pose_params)
+        batch_size = target["verts"].shape[0]
+        canonical_params = self._canonical_model_params.unsqueeze(0).expand(batch_size, -1)
+        canonical = self._query(canonical_params)
+        transforms = mhr_lbs.joint_relative_transforms(
+            target["joint_pos"],
+            target["joint_rotmat"],
+            canonical["joint_pos"],
+            canonical["joint_rotmat"],
+        )
+
+        vertices = canonical["verts"]
+        weights = self._skinning_weights.to(device=vertices.device, dtype=vertices.dtype)
+        homogeneous = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1)
+        transformed = torch.einsum("bjkl,bvl->bjvk", transforms, homogeneous)[..., :3]
+        rigid_vertices = torch.einsum("vj,bjvc->bvc", weights, transformed)
+        residuals = target["verts"] - rigid_vertices
+
+        if self.hand_only:
+            residuals = residuals[:, self.hand_vertex_mask().to(residuals.device)]
+        return residuals
+
     def subdivide(
         self, mesh: trimesh.Trimesh, n_iters: int
     ) -> tuple[trimesh.Trimesh, npt.NDArray[np.integer[Any]]]:

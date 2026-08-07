@@ -73,6 +73,22 @@ class BodyModel(ABC):
         deliberately not.
         """
 
+    def pose_residuals(self, pose_params: torch.Tensor) -> torch.Tensor | None:
+        """Return pose-dependent per-vertex offsets in the posed frame.
+
+        Most body models used by this repository are represented exactly by
+        rigid joint transforms plus LBS weights, so they return ``None``.  A
+        model such as MHR may have an additional internal pose-corrective
+        stage.  Its backend can return the residual relative to the rigid-LBS
+        result here, allowing the shared mesh/deformer code to consume it
+        without knowing the backend's corrective representation.
+
+        The returned tensor, when present, is ``(B,V,3)`` or ``(V,3)`` for
+        batched or unbatched pose input respectively, and is expressed in the
+        same frame as the result of :meth:`lbs`.
+        """
+        return None
+
     def lbs(
         self,
         pose_params: torch.Tensor,
@@ -95,6 +111,13 @@ class BodyModel(ABC):
             bone_transforms,
             lbs_weights if lbs_weights is not None else weights,
         )
+        residuals = self.pose_residuals(pose_params)
+        if residuals is not None:
+            if residuals.ndim == 2:
+                residuals = residuals.unsqueeze(0)
+            if posed.ndim == 2:
+                posed = posed.unsqueeze(0)
+            posed = posed + residuals.to(device=posed.device, dtype=posed.dtype)
         return posed[0] if pose_params.ndim == 1 and posed.ndim == 3 else posed
 
     def posed_vertices(

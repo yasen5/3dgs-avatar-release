@@ -92,6 +92,7 @@ class DirectPoseOptimization(nn.Module):
         updated_camera.update(
             rots=pose_rot.unsqueeze(0),
             bone_transforms=bone_transforms,
+            mhr_model_params=model_params,
         )
 
         # keeps the optimized pose close to the tracked initialization, so
@@ -153,7 +154,11 @@ class DirectPoseOptimization(nn.Module):
         updated_cameras: list[Camera] = []
         for b, cam in enumerate(cameras):
             updated = cam.copy()
-            updated.update(rots=pose_rot[b:b + 1], bone_transforms=bone_transforms[b])
+            updated.update(
+                rots=pose_rot[b:b + 1],
+                bone_transforms=bone_transforms[b],
+                mhr_model_params=model_params[b:b + 1],
+            )
             updated_cameras.append(updated)
 
         loss_pose = (model_params - self.model_params_init[idx]).square().mean()

@@ -78,6 +78,7 @@ class RawFrame(TypedDict):
     mask: torch.Tensor
     rots: torch.Tensor
     bone_transforms: torch.Tensor
+    mhr_model_params: torch.Tensor
 
 
 class MHRNativeDataset(Dataset[Camera]):
@@ -500,6 +501,7 @@ class MHRNativeDataset(Dataset[Camera]):
 
         pose_rot = self.pose_rot_all[idx]  # (127,9)
         bone_transforms = self.bone_transforms_all[idx]  # (127,4,4)
+        model_params = self.parms["model_params"][idx].float()  # (204,)
 
         return RawFrame(
             frame_id=frame_id,
@@ -509,6 +511,7 @@ class MHRNativeDataset(Dataset[Camera]):
             mask=mask_t,
             rots=pose_rot.float().unsqueeze(0),
             bone_transforms=bone_transforms.clone(),
+            mhr_model_params=model_params.clone(),
         )
 
     def build_camera(self, raw: RawFrame) -> Camera:
@@ -527,6 +530,7 @@ class MHRNativeDataset(Dataset[Camera]):
             rots=raw['rots'],
             Jtrs=self.metadata['jtr_norm'].unsqueeze(0),
             bone_transforms=raw['bone_transforms'].float(),
+            mhr_model_params=raw['mhr_model_params'].float().unsqueeze(0),
         )
 
     def getitem(self, idx: int) -> Camera:
